@@ -1,82 +1,119 @@
-```java
-package com.arakoodev.edgechains.utils;
+```groovy
+// build.gradle.kts / build.gradle dependency
+implementation("software.amazon.awssdk:comprehend:2.20.0")
+```
 
-import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
+```java
+package com.edgechains.lib.aws;
+
+import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.comprehend.ComprehendClient;
+import software.amazon.awssdk.services.comprehend.ComprehendClientBuilder;
 import software.amazon.awssdk.services.comprehend.model.DetectPiiEntitiesRequest;
 import software.amazon.awssdk.services.comprehend.model.DetectPiiEntitiesResponse;
 import software.amazon.awssdk.services.comprehend.model.LanguageCode;
 import software.amazon.awssdk.services.comprehend.model.PiiEntity;
 
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Objects;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 /**
- * Utility to redact sensitive / PII data using AWS Comprehend.
+ * Utility to detect and redact sensitive PII (Personally Identifiable Information)
+ * using AWS Comprehend.
  */
-public class ComprehendDataRedactor implements AutoCloseable {
+public class AwsComprehendRedactor implements AutoCloseable {
 
     private final ComprehendClient comprehendClient;
-    private final LanguageCode defaultLanguage;
-    private final boolean closeClientOnShutdown;
+    private final LanguageCode defaultLanguageCode;
+    private final float minScoreThreshold;
 
-    public ComprehendDataRedactor() {
-        this(Region.US_EAST_1, LanguageCode.EN);
+    public enum MaskMode {
+        ENTITY_TYPE, // e.g., "[SSN]", "[EMAIL]"
+        FIXED_STRING, // e.g., "[REDACTED]"
+        CHARACTER_MASK // e.g., "********"
     }
 
-    public ComprehendDataRedactor(Region region, LanguageCode defaultLanguage) {
-        this.comprehendClient = ComprehendClient.builder()
-                .credentialsProvider(DefaultCredentialsProvider.create())
-                .region(region)
-                .build();
-        this.defaultLanguage = defaultLanguage;
-        this.closeClientOnShutdown = true;
+    public AwsComprehendRedactor() {
+        this(ComprehendClient.builder().build(), LanguageCode.EN, 0.5f);
     }
 
-    public ComprehendDataRedactor(ComprehendClient comprehendClient, LanguageCode defaultLanguage) {
-        this.comprehendClient = comprehendClient;
-        this.defaultLanguage = defaultLanguage;
-        this.closeClientOnShutdown = false;
+    public AwsComprehendRedactor(Region region) {
+        this(ComprehendClient.builder().region(region).build(), LanguageCode.EN, 0.5f);
+    }
+
+    public AwsComprehendRedactor(Region region, AwsCredentialsProvider credentialsProvider) {
+        this(
+                ComprehendClient.builder()
+                        .region(region)
+                        .credentialsProvider(credentialsProvider)
+                        .build(),
+                LanguageCode.EN,
+                0.5f);
+    }
+
+    public AwsComprehendRedactor(ComprehendClient comprehendClient) {
+        this(comprehendClient, LanguageCode.EN, 0.5f);
+    }
+
+    public AwsComprehendRedactor(
+            ComprehendClient comprehendClient,
+            LanguageCode defaultLanguageCode,
+            float minScoreThreshold) {
+        this.comprehendClient = Objects.requireNonNull(comprehendClient, "comprehendClient must not be null");
+        this.defaultLanguageCode = Objects.requireNonNull(defaultLanguageCode, "defaultLanguageCode must not be null");
+        this.minScoreThreshold = minScoreThreshold;
     }
 
     /**
-     * Redacts PII entities detected in the text with a generic '[REDACTED]' placeholder.
+     * Redacts all detected PII entities replacing them with their entity type (e.g. [NAME], [EMAIL]).
      *
      * @param text Input text containing sensitive information.
      * @return Redacted text.
      */
     public String redact(String text) {
-        return redact(text, this.defaultLanguage, "[REDACTED]");
+        return redact(text, this.defaultLanguageCode, MaskMode.ENTITY_TYPE, "[REDACTED]", null);
     }
 
     /**
-     * Redacts PII entities detected in the text with the PII type tag (e.g. '[NAME]', '[EMAIL]').
+     * Redacts all detected PII entities replacing them with a fixed mask string.
      *
      * @param text Input text containing sensitive information.
-     * @return Redacted text with entity-specific tags.
+     * @param mask Replacement token (e.g., "[REDACTED]" or "***").
+     * @return Redacted text.
      */
-    public String redactWithTypeLabels(String text) {
-        return redact(text, this.defaultLanguage, null);
+    public String redact(String text, String mask) {
+        return redact(text, this.defaultLanguageCode, MaskMode.FIXED_STRING, mask, null);
     }
 
     /**
-     * Redacts PII entities detected in the text.
+     * Redacts sensitive data with full customization options.
      *
-     * @param text Input text.
-     * @param language Language of the text.
-     * @param maskPattern Replacement mask, or null to replace with [ENTITY_TYPE].
-     * @return Redacted text.
+     * @param text Input text to redact.
+     * @param languageCode Language of the input text.
+     * @param maskMode How PII entities should be masked.
+     * @param customMask Custom string to use if MaskMode.FIXED_STRING is selected.
+     * @param targetEntityTypes Optional set of entity types to redact (null or empty redacts all).
+     * @return Redacted text string.
      */
-    public String redact(String text, LanguageCode language, String maskPattern) {
+    public String redact(
+            String text,
+            LanguageCode languageCode,
+            MaskMode maskMode,
+            String customMask,
+            Set<String> targetEntityTypes) {
+
         if (text == null || text.trim().isEmpty()) {
             return text;
         }
 
         DetectPiiEntitiesRequest request = DetectPiiEntitiesRequest.builder()
                 .text(text)
-                .languageCode(language)
+                .languageCode(languageCode != null ? languageCode : this.defaultLanguageCode)
                 .build();
 
         DetectPiiEntitiesResponse response = comprehendClient.detectPiiEntities(request);
@@ -86,106 +123,186 @@ public class ComprehendDataRedactor implements AutoCloseable {
             return text;
         }
 
-        // Sort entities in reverse order of start offset to preserve indices during replacement
-        List<PiiEntity> sortedEntities = entities.stream()
+        // Filter by confidence threshold and specified entity types
+        List<PiiEntity> filteredEntities = entities.stream()
+                .filter(e -> e.score() != null && e.score() >= this.minScoreThreshold)
+                .filter(e -> targetEntityTypes == null || targetEntityTypes.isEmpty()
+                        || targetEntityTypes.contains(e.typeAsString()))
+                // Sort descending by beginOffset so earlier indices stay valid during replacements
                 .sorted(Comparator.comparingInt(PiiEntity::beginOffset).reversed())
                 .collect(Collectors.toList());
 
         StringBuilder sb = new StringBuilder(text);
-        for (PiiEntity entity : sortedEntities) {
+
+        for (PiiEntity entity : filteredEntities) {
             int start = entity.beginOffset();
             int end = entity.endOffset();
-            String replacement = (maskPattern != null) ? maskPattern : "[" + entity.typeAsString() + "]";
+
+            if (start < 0 || end > sb.length() || start >= end) {
+                continue;
+            }
+
+            String replacement;
+            switch (maskMode) {
+                case FIXED_STRING:
+                    replacement = customMask != null ? customMask : "[REDACTED]";
+                    break;
+                case CHARACTER_MASK:
+                    replacement = "*".repeat(end - start);
+                    break;
+                case ENTITY_TYPE:
+                default:
+                    replacement = "[" + entity.typeAsString() + "]";
+                    break;
+            }
+
             sb.replace(start, end, replacement);
         }
 
         return sb.toString();
     }
 
+    /**
+     * Inspects text and returns list of detected PII entities.
+     *
+     * @param text Input text.
+     * @return List of detected PII entities.
+     */
+    public List<PiiEntity> detectPii(String text) {
+        if (text == null || text.trim().isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        DetectPiiEntitiesRequest request = DetectPiiEntitiesRequest.builder()
+                .text(text)
+                .languageCode(this.defaultLanguageCode)
+                .build();
+
+        return comprehendClient.detectPiiEntities(request).entities();
+    }
+
+    public ComprehendClient getComprehendClient() {
+        return comprehendClient;
+    }
+
     @Override
     public void close() {
-        if (closeClientOnShutdown && comprehendClient != null) {
-            comprehendClient.close();
+        if (this.comprehendClient != null) {
+            this.comprehendClient.close();
         }
     }
 }
 ```
 
-```python
-"""
-AWS Comprehend PII Redaction Utility & Bounty Watcher Individual Issue Splitter
-"""
+```java
+package com.edgechains.lib.aws;
 
-import re
-from typing import Optional, List, Dict
-import boto3
-from botocore.config import Config
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
+import software.amazon.awssdk.services.comprehend.ComprehendClient;
+import software.amazon.awssdk.services.comprehend.model.DetectPiiEntitiesRequest;
+import software.amazon.awssdk.services.comprehend.model.DetectPiiEntitiesResponse;
+import software.amazon.awssdk.services.comprehend.model.PiiEntity;
+import software.amazon.awssdk.services.comprehend.model.PiiEntityType;
 
+import java.util.List;
+import java.util.Set;
 
-class ComprehendRedactor:
-    """Utility to redact sensitive / PII data using AWS Comprehend."""
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.when;
 
-    def __init__(self, region_name: str = "us-east-1", language_code: str = "en"):
-        self.language_code = language_code
-        self.client = boto3.client(
-            "comprehend",
-            region_name=region_name,
-            config=Config(retries={"max_attempts": 3, "mode": "standard"}),
-        )
+public class AwsComprehendRedactorTest {
 
-    def redact(self, text: str, mask: Optional[str] = "[REDACTED]") -> str:
-        if not text or not text.strip():
-            return text
+    private ComprehendClient mockClient;
+    private AwsComprehendRedactor redactor;
 
-        response = self.client.detect_pii_entities(
-            Text=text,
-            LanguageCode=self.language_code,
-        )
+    @BeforeEach
+    public void setUp() {
+        mockClient = Mockito.mock(ComprehendClient.class);
+        redactor = new AwsComprehendRedactor(mockClient);
+    }
 
-        entities = response.get("Entities", [])
-        if not entities:
-            return text
+    @AfterEach
+    public void tearDown() {
+        redactor.close();
+    }
 
-        # Sort descending by BeginOffset to replace without invalidating remaining offsets
-        entities.sort(key=lambda e: e["BeginOffset"], reverse=True)
+    @Test
+    public void testRedactWithEntityType() {
+        String input = "My email is test@example.com and phone is 123-456-7890.";
 
-        redacted = list(text)
-        for entity in entities:
-            start = entity["BeginOffset"]
-            end = entity["EndOffset"]
-            replacement = mask if mask is not None else f"[{entity['Type']}]"
-            redacted[start:end] = list(replacement)
+        PiiEntity emailEntity = PiiEntity.builder()
+                .type(PiiEntityType.EMAIL)
+                .beginOffset(12)
+                .endOffset(28)
+                .score(0.99f)
+                .build();
 
-        return "".join(redacted)
+        PiiEntity phoneEntity = PiiEntity.builder()
+                .type(PiiEntityType.PHONE)
+                .beginOffset(42)
+                .endOffset(54)
+                .score(0.98f)
+                .build();
 
+        when(mockClient.detectPiiEntities(any(DetectPiiEntitiesRequest.class)))
+                .thenReturn(DetectPiiEntitiesResponse.builder().entities(List.of(emailEntity, phoneEntity)).build());
 
-class BountyWatcher:
-    """
-    Parses bundled watcher issues and emits separate individual issues per bounty.
-    """
+        String result = redactor.redact(input);
+        assertEquals("My email is [EMAIL] and phone is [PHONE].", result);
+    }
 
-    BOUNTY_REGEX = re.compile(
-        r"[-*]\s*(?:🔴|🟢|🟡)?\s*\*\*([^\*]+)\*\*\s*[·-]\s*\[([^\]]+)\]\((https?://[^\)]+)\)",
-        re.MULTILINE,
-    )
+    @Test
+    public void testRedactWithFixedMask() {
+        String input = "Hello John Doe!";
 
-    @staticmethod
-    def extract_bounties(issue_body: str) -> List[Dict[str, str]]:
-        bounties = []
-        for match in BountyWatcher.BOUNTY_REGEX.finditer(issue_body):
-            reward, title, url = match.groups()
-            bounties.append({
-                "reward": reward.strip(),
-                "title": title.strip(),
-                "url": url.strip(),
-            })
-        return bounties
+        PiiEntity nameEntity = PiiEntity.builder()
+                .type(PiiEntityType.NAME)
+                .beginOffset(6)
+                .endOffset(14)
+                .score(0.95f)
+                .build();
 
-    @staticmethod
-    def create_individual_issue_payload(bounty: Dict[str, str], cc_handle: Optional[str] = None) -> Dict[str, str]:
-        title = f"{bounty['reward']} · {bounty['title']}"
-        body = f"### Bounty Details\n\n- **Reward:** {bounty['reward']}\n- **Original Issue:** {bounty['url']}\n"
-        if cc_handle:
-            body += f"\ncc @{cc_handle.lstrip('@')}\n"
-        return {"title": title, "body": body}
+        when(mockClient.detectPiiEntities(any(DetectPiiEntitiesRequest.class)))
+                .thenReturn(DetectPiiEntitiesResponse.builder().entities(List.of(nameEntity)).build());
+
+        String result = redactor.redact(input, "[REDACTED]");
+        assertEquals("Hello [REDACTED]!", result);
+    }
+
+    @Test
+    public void testFilterByTargetEntityType() {
+        String input = "John at test@example.com";
+
+        PiiEntity name = PiiEntity.builder()
+                .type(PiiEntityType.NAME)
+                .beginOffset(0)
+                .endOffset(4)
+                .score(0.99f)
+                .build();
+
+        PiiEntity email = PiiEntity.builder()
+                .type(PiiEntityType.EMAIL)
+                .beginOffset(8)
+                .endOffset(24)
+                .score(0.99f)
+                .build();
+
+        when(mockClient.detectPiiEntities(any(DetectPiiEntitiesRequest.class)))
+                .thenReturn(DetectPiiEntitiesResponse.builder().entities(List.of(name, email)).build());
+
+        String result = redactor.redact(
+                input,
+                null,
+                AwsComprehendRedactor.MaskMode.FIXED_STRING,
+                "***",
+                Set.of("EMAIL")
+        );
+
+        assertEquals("John at ***", result);
+    }
+}
 ```
