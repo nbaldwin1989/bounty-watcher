@@ -1,7 +1,8 @@
-### 1. Solution for `arakoodev/EdgeChains#290`: AWS Comprehend Data Redaction Utility
-
-#### `edgechains/libraries/com.edgechains.lib/src/main/java/com/edgechains/lib/aws/AWSComprehendRedactor.java`
 ```java
+// ============================================================================
+// File: src/main/java/com/edgechains/lib/aws/AwsComprehendRedactionUtil.java
+// ============================================================================
+
 package com.edgechains.lib.aws;
 
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
@@ -12,76 +13,100 @@ import software.amazon.awssdk.services.comprehend.model.DetectPiiEntitiesRequest
 import software.amazon.awssdk.services.comprehend.model.DetectPiiEntitiesResponse;
 import software.amazon.awssdk.services.comprehend.model.LanguageCode;
 import software.amazon.awssdk.services.comprehend.model.PiiEntity;
+import software.amazon.awssdk.services.comprehend.model.PiiEntityType;
 
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 import java.util.stream.Collectors;
 
-public class AWSComprehendRedactor implements AutoCloseable {
+/**
+ * Utility for detecting and redacting Personally Identifiable Information (PII)
+ * using AWS Comprehend.
+ */
+public class AwsComprehendRedactionUtil implements AutoCloseable {
+
+    public enum RedactionStrategy {
+        LABEL,       // Replaces entity with [ENTITY_TYPE], e.g. [EMAIL], [SSN]
+        MASK,        // Replaces entity with [REDACTED]
+        CHARACTER    // Replaces each character with a mask character (e.g. '*')
+    }
 
     private final ComprehendClient comprehendClient;
+    private final boolean ownsClient;
 
-    public enum RedactionMaskMode {
-        MASK_CHAR,     // Replace characters with a mask character (e.g., ***)
-        ENTITY_TYPE,   // Replace entity with [TYPE] (e.g., [EMAIL], [SSN])
-        FIXED_LABEL    // Replace entity with fixed string (e.g., [REDACTED])
+    public AwsComprehendRedactionUtil() {
+        this(ComprehendClient.builder()
+                .credentialsProvider(DefaultCredentialsProvider.create())
+                .region(Region.US_EAST_1)
+                .build(), true);
     }
 
-    public AWSComprehendRedactor() {
-        this(DefaultCredentialsProvider.create(), Region.US_EAST_1);
-    }
-
-    public AWSComprehendRedactor(Region region) {
-        this(DefaultCredentialsProvider.create(), region);
-    }
-
-    public AWSComprehendRedactor(AwsCredentialsProvider credentialsProvider, Region region) {
-        this.comprehendClient = ComprehendClient.builder()
-                .credentialsProvider(credentialsProvider)
+    public AwsComprehendRedactionUtil(Region region, AwsCredentialsProvider credentialsProvider) {
+        this(ComprehendClient.builder()
                 .region(region)
-                .build();
+                .credentialsProvider(credentialsProvider)
+                .build(), true);
     }
 
-    public AWSComprehendRedactor(ComprehendClient comprehendClient) {
+    public AwsComprehendRedactionUtil(ComprehendClient comprehendClient) {
+        this(comprehendClient, false);
+    }
+
+    private AwsComprehendRedactionUtil(ComprehendClient comprehendClient, boolean ownsClient) {
         this.comprehendClient = Objects.requireNonNull(comprehendClient, "comprehendClient must not be null");
+        this.ownsClient = ownsClient;
     }
 
-    public List<PiiEntity> detectPiiEntities(String text, LanguageCode languageCode) {
+    /**
+     * Redacts all PII entities using default settings (Strategy: LABEL, Lang: EN, MinScore: 0.7).
+     */
+    public String redactPii(String text) {
+        return redactPii(text, LanguageCode.EN, RedactionStrategy.LABEL, null, 0.7f, '*');
+    }
+
+    /**
+     * Redacts PII entities matching target entity types with custom strategy and score threshold.
+     */
+    public String redactPii(
+            String text,
+            LanguageCode languageCode,
+            RedactionStrategy strategy,
+            Set<PiiEntityType> targetTypes,
+            float minConfidenceScore,
+            char maskCharacter) {
+
         if (text == null || text.trim().isEmpty()) {
-            return List.of();
+            return text;
         }
+
         DetectPiiEntitiesRequest request = DetectPiiEntitiesRequest.builder()
                 .text(text)
                 .languageCode(languageCode != null ? languageCode : LanguageCode.EN)
                 .build();
 
         DetectPiiEntitiesResponse response = comprehendClient.detectPiiEntities(request);
-        return response.entities();
-    }
+        List<PiiEntity> entities = response.entities();
 
-    public String redactPii(String text) {
-        return redactPii(text, LanguageCode.EN, RedactionMaskMode.ENTITY_TYPE, '*');
-    }
-
-    public String redactPii(String text, LanguageCode languageCode, RedactionMaskMode mode, char maskChar) {
-        if (text == null || text.isEmpty()) {
+        if (entities == null || entities.isEmpty()) {
             return text;
         }
 
-        List<PiiEntity> entities = detectPiiEntities(text, languageCode);
-        if (entities.isEmpty()) {
-            return text;
-        }
-
-        // Sort descending by beginOffset so string replacements do not affect earlier offsets
-        List<PiiEntity> sortedEntities = entities.stream()
-                .sorted(Comparator.comparingInt(PiiEntity::beginOffset).reversed())
+        List<PiiEntity> filtered = entities.stream()
+                .filter(e -> e.score() != null && e.score() >= minConfidenceScore)
+                .filter(e -> targetTypes == null || targetTypes.isEmpty() || targetTypes.contains(e.type()))
                 .collect(Collectors.toList());
 
-        StringBuilder redacted = new StringBuilder(text);
+        if (filtered.isEmpty()) {
+            return text;
+        }
 
-        for (PiiEntity entity : sortedEntities) {
+        List<PiiEntity> sorted = resolveOverlapsAndSortDescending(filtered);
+
+        StringBuilder redacted = new StringBuilder(text);
+        for (PiiEntity entity : sorted) {
             int start = entity.beginOffset();
             int end = entity.endOffset();
 
@@ -90,16 +115,17 @@ public class AWSComprehendRedactor implements AutoCloseable {
             }
 
             String replacement;
-            switch (mode) {
-                case ENTITY_TYPE:
-                    replacement = "[" + entity.typeAsString() + "]";
+            switch (strategy) {
+                case LABEL:
+                    replacement = "[" + (entity.typeAsString() != null ? entity.typeAsString() : "PII") + "]";
                     break;
-                case FIXED_LABEL:
-                    replacement = "[REDACTED]";
+                case CHARACTER:
+                    int length = end - start;
+                    replacement = String.valueOf(maskCharacter).repeat(length);
                     break;
-                case MASK_CHAR:
+                case MASK:
                 default:
-                    replacement = String.valueOf(maskChar).repeat(end - start);
+                    replacement = "[REDACTED]";
                     break;
             }
 
@@ -109,19 +135,55 @@ public class AWSComprehendRedactor implements AutoCloseable {
         return redacted.toString();
     }
 
+    public List<PiiEntity> detectPii(String text, LanguageCode languageCode) {
+        if (text == null || text.trim().isEmpty()) {
+            return List.of();
+        }
+
+        DetectPiiEntitiesRequest request = DetectPiiEntitiesRequest.builder()
+                .text(text)
+                .languageCode(languageCode != null ? languageCode : LanguageCode.EN)
+                .build();
+
+        return comprehendClient.detectPiiEntities(request).entities();
+    }
+
+    private List<PiiEntity> resolveOverlapsAndSortDescending(List<PiiEntity> entities) {
+        List<PiiEntity> sortedAsc = new ArrayList<>(entities);
+        sortedAsc.sort(Comparator.comparingInt(PiiEntity::beginOffset)
+                .thenComparing((a, b) -> Integer.compare(b.endOffset(), a.endOffset())));
+
+        List<PiiEntity> nonOverlapping = new ArrayList<>();
+        int lastEnd = -1;
+
+        for (PiiEntity entity : sortedAsc) {
+            if (entity.beginOffset() >= lastEnd) {
+                nonOverlapping.add(entity);
+                lastEnd = entity.endOffset();
+            }
+        }
+
+        nonOverlapping.sort((a, b) -> Integer.compare(b.beginOffset(), a.beginOffset()));
+        return nonOverlapping;
+    }
+
     @Override
     public void close() {
-        if (this.comprehendClient != null) {
-            this.comprehendClient.close();
+        if (ownsClient && comprehendClient != null) {
+            comprehendClient.close();
         }
     }
 }
 ```
 
-#### `edgechains/libraries/com.edgechains.lib/src/test/java/com/edgechains/lib/aws/AWSComprehendRedactorTest.java`
 ```java
+// ============================================================================
+// File: src/test/java/com/edgechains/lib/aws/AwsComprehendRedactionUtilTest.java
+// ============================================================================
+
 package com.edgechains.lib.aws;
 
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 import software.amazon.awssdk.services.comprehend.ComprehendClient;
@@ -132,195 +194,111 @@ import software.amazon.awssdk.services.comprehend.model.PiiEntity;
 import software.amazon.awssdk.services.comprehend.model.PiiEntityType;
 
 import java.util.List;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.when;
 
-public class AWSComprehendRedactorTest {
+class AwsComprehendRedactionUtilTest {
+
+    private ComprehendClient comprehendClientMock;
+    private AwsComprehendRedactionUtil redactionUtil;
+
+    @BeforeEach
+    void setUp() {
+        comprehendClientMock = Mockito.mock(ComprehendClient.class);
+        redactionUtil = new AwsComprehendRedactionUtil(comprehendClientMock);
+    }
 
     @Test
-    public void testRedactPiiWithEntityType() {
-        ComprehendClient mockClient = Mockito.mock(ComprehendClient.class);
-        String input = "Hello, my email is test@example.com and phone is 555-0199.";
+    void testRedactPiiWithLabelStrategy() {
+        String input = "My email is user@example.com and phone is 555-0199.";
 
         PiiEntity emailEntity = PiiEntity.builder()
-                .beginOffset(19)
-                .endOffset(35)
                 .type(PiiEntityType.EMAIL)
+                .beginOffset(12)
+                .endOffset(28)
+                .score(0.99f)
                 .build();
 
         PiiEntity phoneEntity = PiiEntity.builder()
-                .beginOffset(50)
-                .endOffset(58)
                 .type(PiiEntityType.PHONE)
+                .beginOffset(42)
+                .endOffset(50)
+                .score(0.95f)
                 .build();
 
-        DetectPiiEntitiesResponse response = DetectPiiEntitiesResponse.builder()
-                .entities(List.of(emailEntity, phoneEntity))
+        when(comprehendClientMock.detectPiiEntities(any(DetectPiiEntitiesRequest.class)))
+                .thenReturn(DetectPiiEntitiesResponse.builder().entities(List.of(emailEntity, phoneEntity)).build());
+
+        String result = redactionUtil.redactPii(input);
+        assertEquals("My email is [EMAIL] and phone is [PHONE].", result);
+    }
+
+    @Test
+    void testRedactPiiWithMaskStrategy() {
+        String input = "User SSN is 000-00-0000.";
+
+        PiiEntity ssnEntity = PiiEntity.builder()
+                .type(PiiEntityType.SSN)
+                .beginOffset(12)
+                .endOffset(23)
+                .score(0.98f)
                 .build();
 
-        when(mockClient.detectPiiEntities(any(DetectPiiEntitiesRequest.class))).thenReturn(response);
+        when(comprehendClientMock.detectPiiEntities(any(DetectPiiEntitiesRequest.class)))
+                .thenReturn(DetectPiiEntitiesResponse.builder().entities(List.of(ssnEntity)).build());
 
-        AWSComprehendRedactor redactor = new AWSComprehendRedactor(mockClient);
-        String result = redactor.redactPii(input, LanguageCode.EN, AWSComprehendRedactor.RedactionMaskMode.ENTITY_TYPE, '*');
+        String result = redactionUtil.redactPii(
+                input,
+                LanguageCode.EN,
+                AwsComprehendRedactionUtil.RedactionStrategy.MASK,
+                Set.of(PiiEntityType.SSN),
+                0.8f,
+                '*'
+        );
+        assertEquals("User SSN is [REDACTED].", result);
+    }
 
-        assertEquals("Hello, my email is [EMAIL] and phone is [PHONE].", result);
+    @Test
+    void testRedactPiiWithCharacterMaskStrategy() {
+        String input = "Secret: 12345";
+
+        PiiEntity entity = PiiEntity.builder()
+                .type(PiiEntityType.PIN)
+                .beginOffset(8)
+                .endOffset(13)
+                .score(0.90f)
+                .build();
+
+        when(comprehendClientMock.detectPiiEntities(any(DetectPiiEntitiesRequest.class)))
+                .thenReturn(DetectPiiEntitiesResponse.builder().entities(List.of(entity)).build());
+
+        String result = redactionUtil.redactPii(
+                input,
+                LanguageCode.EN,
+                AwsComprehendRedactionUtil.RedactionStrategy.CHARACTER,
+                null,
+                0.7f,
+                '#'
+        );
+        assertEquals("Secret: #####", result);
+    }
+
+    @Test
+    void testEmptyAndNullInputs() {
+        assertEquals("", redactionUtil.redactPii(""));
+        assertEquals(null, redactionUtil.redactPii(null));
     }
 }
 ```
 
-#### Dependency configuration (`pom.xml` / `build.gradle` snippet)
 ```xml
+<!-- Add to pom.xml dependency block if not already present -->
 <dependency>
     <groupId>software.amazon.awssdk</groupId>
     <artifactId>comprehend</artifactId>
-    <version>2.20.162</version>
+    <version>2.25.16</version>
 </dependency>
-```
-
----
-
-### 2. Solution for `BAWES-Universe/workadventure-universe#1`: WorkAdventure Mobile Wrapper (Android & iOS)
-
-#### `mobile/package.json`
-```json
-{
-  "name": "bawes-universe-mobile",
-  "version": "1.0.0",
-  "private": true,
-  "scripts": {
-    "android": "react-native run-android",
-    "ios": "react-native run-ios",
-    "start": "react-native start"
-  },
-  "dependencies": {
-    "react": "18.2.0",
-    "react-native": "0.72.6",
-    "react-native-safe-area-context": "^4.7.4",
-    "react-native-webview": "^13.6.2"
-  }
-}
-```
-
-#### `mobile/App.tsx`
-```tsx
-import React, { useRef, useState } from 'react';
-import {
-  SafeAreaView,
-  StyleSheet,
-  StatusBar,
-  View,
-  ActivityIndicator,
-  BackHandler,
-  Platform,
-  PermissionsAndroid,
-} from 'react-native';
-import { WebView } from 'react-native-webview';
-
-const WORKADVENTURE_URL = 'https://universe.bawes.net';
-
-export default function App() {
-  const webViewRef = useRef<WebView>(null);
-  const [canGoBack, setCanGoBack] = useState(false);
-  const [loading, setLoading] = useState(true);
-
-  React.useEffect(() => {
-    if (Platform.OS === 'android') {
-      const requestPermissions = async () => {
-        await PermissionsAndroid.requestMultiple([
-          PermissionsAndroid.PERMISSIONS.CAMERA,
-          PermissionsAndroid.PERMISSIONS.RECORD_AUDIO,
-        ]);
-      };
-      requestPermissions();
-
-      const onBackPress = () => {
-        if (canGoBack && webViewRef.current) {
-          webViewRef.current.goBack();
-          return true;
-        }
-        return false;
-      };
-      BackHandler.addEventListener('hardwareBackPress', onBackPress);
-      return () => BackHandler.removeEventListener('hardwareBackPress', onBackPress);
-    }
-  }, [canGoBack]);
-
-  // Inject virtual touch controls and viewport scaling for mobile WorkAdventure play
-  const injectedJS = `
-    (function() {
-      const meta = document.createElement('meta');
-      meta.name = 'viewport';
-      meta.content = 'width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no';
-      document.getElementsByTagName('head')[0].appendChild(meta);
-      window.isWorkAdventureNativeApp = true;
-    })();
-    true;
-  `;
-
-  return (
-    <SafeAreaView style={styles.container}>
-      <StatusBar barStyle="light-content" backgroundColor="#000000" />
-      <WebView
-        ref={webViewRef}
-        source={{ uri: WORKADVENTURE_URL }}
-        style={styles.webview}
-        injectedJavaScript={injectedJS}
-        javaScriptEnabled={true}
-        domStorageEnabled={true}
-        mediaPlaybackRequiresUserAction={false}
-        allowsInlineMediaPlayback={true}
-        camera={true}
-        microphone={true}
-        originWhitelist={['*']}
-        onNavigationStateChange={(navState) => setCanGoBack(navState.canGoBack)}
-        onLoadEnd={() => setLoading(false)}
-      />
-      {loading && (
-        <View style={styles.loader}>
-          <ActivityIndicator size="large" color="#ffffff" />
-        </View>
-      )}
-    </SafeAreaView>
-  );
-}
-
-const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: '#000000',
-  },
-  webview: {
-    flex: 1,
-    backgroundColor: '#000000',
-  },
-  loader: {
-    ...StyleSheet.absoluteFillObject,
-    backgroundColor: '#000000',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-});
-```
-
-#### `mobile/android/app/src/main/AndroidManifest.xml` (Permissions excerpt)
-```xml
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <uses-permission android:name="android.permission.INTERNET" />
-    <uses-permission android:name="android.permission.CAMERA" />
-    <uses-permission android:name="android.permission.RECORD_AUDIO" />
-    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
-    <uses-feature android:name="android.hardware.camera" android:required="false" />
-    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
-    <uses-feature android:name="android.hardware.microphone" android:required="false" />
-</manifest>
-```
-
-#### `mobile/ios/Podfile` (WebRTC camera/mic privacy permissions in `Info.plist`)
-```xml
-<key>NSCameraUsageDescription</key>
-<string>WorkAdventure BAWES Universe requires camera access for proximity video chat.</string>
-<key>NSMicrophoneUsageDescription</key>
-<string>WorkAdventure BAWES Universe requires microphone access for proximity voice chat.</string>
 ```
