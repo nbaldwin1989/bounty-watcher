@@ -1,103 +1,81 @@
-### 1. ArakooDev/EdgeChains: AWS Comprehend Data Redaction Utility
-
-#### `build.gradle`
-```groovy
-dependencies {
-    // AWS SDK v2 Comprehend
-    implementation platform('software.amazon.awssdk:bom:2.25.16')
-    implementation 'software.amazon.awssdk:comprehend'
-    implementation 'software.amazon.awssdk:auth'
-
-    // Testing
-    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.0'
-    testImplementation 'org.mockito:mockito-junit-jupiter:5.11.0'
-}
-```
-
-#### `src/main/java/com/edgechains/lib/utils/aws/RedactionStrategy.java`
 ```java
-package com.edgechains.lib.utils.aws;
-
-public enum RedactionStrategy {
-    /** Replaces entity with generic "[REDACTED]" */
-    GENERIC_LABEL,
-    /** Replaces entity with entity type label, e.g., "[NAME]", "[SSN]", "[EMAIL]" */
-    ENTITY_TYPE_LABEL,
-    /** Replaces entity characters with asterisks matching original length */
-    ASTERISKS
-}
-```
-
-#### `src/main/java/com/edgechains/lib/utils/aws/AwsComprehendRedactor.java`
-```java
-package com.edgechains.lib.utils.aws;
+package com.edgechains.lib.utils;
 
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
+import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.comprehend.ComprehendClient;
-import software.amazon.awssdk.services.comprehend.ComprehendClientBuilder;
 import software.amazon.awssdk.services.comprehend.model.DetectPiiEntitiesRequest;
 import software.amazon.awssdk.services.comprehend.model.DetectPiiEntitiesResponse;
 import software.amazon.awssdk.services.comprehend.model.LanguageCode;
 import software.amazon.awssdk.services.comprehend.model.PiiEntity;
 
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Objects;
 
+/**
+ * Utility for detecting and redacting Personally Identifiable Information (PII)
+ * using AWS Comprehend.
+ */
 public class AwsComprehendRedactor implements AutoCloseable {
 
-    private static final int MAX_AWS_COMPREHEND_BYTES = 100_000;
-    private static final float DEFAULT_CONFIDENCE_THRESHOLD = 0.8f;
-    private static final LanguageCode DEFAULT_LANGUAGE_CODE = LanguageCode.EN;
-
     private final ComprehendClient comprehendClient;
-    private final boolean manageClientLifecycle;
+    private final boolean ownsClient;
+    private final float scoreThreshold;
+
+    public enum RedactionMode {
+        ENTITY_TYPE, // Replaces with entity type tag, e.g., [EMAIL], [NAME]
+        FIXED_MASK,   // Replaces with fixed string, e.g., [REDACTED]
+        ASTERISKS     // Replaces matching characters with asterisks, e.g., ****
+    }
 
     public AwsComprehendRedactor() {
-        this(ComprehendClient.create(), true);
+        this(Region.US_EAST_1, DefaultCredentialsProvider.create(), 0.5f);
     }
 
-    public AwsComprehendRedactor(Region region) {
-        this(ComprehendClient.builder().region(region).build(), true);
-    }
-
-    public AwsComprehendRedactor(Region region, AwsCredentialsProvider credentialsProvider) {
-        this(ComprehendClient.builder()
+    public AwsComprehendRedactor(Region region, AwsCredentialsProvider credentialsProvider, float scoreThreshold) {
+        this.comprehendClient = ComprehendClient.builder()
                 .region(region)
                 .credentialsProvider(credentialsProvider)
-                .build(), true);
+                .build();
+        this.ownsClient = true;
+        this.scoreThreshold = scoreThreshold;
     }
 
-    public AwsComprehendRedactor(ComprehendClient comprehendClient) {
-        this(comprehendClient, false);
-    }
-
-    private AwsComprehendRedactor(ComprehendClient comprehendClient, boolean manageClientLifecycle) {
+    public AwsComprehendRedactor(ComprehendClient comprehendClient, float scoreThreshold) {
         this.comprehendClient = Objects.requireNonNull(comprehendClient, "comprehendClient must not be null");
-        this.manageClientLifecycle = manageClientLifecycle;
+        this.ownsClient = false;
+        this.scoreThreshold = scoreThreshold;
     }
 
     /**
-     * Redacts PII from text using default English language, 0.8 confidence, and ENTITY_TYPE_LABEL strategy.
+     * Redacts PII from text using default EN language and ENTITY_TYPE mode.
      */
     public String redact(String text) {
-        return redact(text, DEFAULT_LANGUAGE_CODE, DEFAULT_CONFIDENCE_THRESHOLD, RedactionStrategy.ENTITY_TYPE_LABEL);
+        return redact(text, LanguageCode.EN, RedactionMode.ENTITY_TYPE, "[REDACTED]");
     }
 
     /**
-     * Redacts PII from text with full customization.
+     * Redacts PII with specified language code and redaction mode.
      */
-    public String redact(String text, LanguageCode languageCode, float confidenceThreshold, RedactionStrategy strategy) {
+    public String redact(String text, LanguageCode languageCode, RedactionMode mode) {
+        return redact(text, languageCode, mode, "[REDACTED]");
+    }
+
+    /**
+     * Redacts PII with full configuration.
+     *
+     * @param text         Raw input text containing potential PII.
+     * @param languageCode Language of the input text.
+     * @param mode         Strategy to use for replacing detected entities.
+     * @param customMask   Fallback mask string when FIXED_MASK mode is used.
+     * @return Redacted text.
+     */
+    public String redact(String text, LanguageCode languageCode, RedactionMode mode, String customMask) {
         if (text == null || text.trim().isEmpty()) {
             return text;
-        }
-
-        // Handle text exceeding AWS Comprehend 100KB payload limit by chunking paragraphs
-        if (text.getBytes(StandardCharsets.UTF_8).length > MAX_AWS_COMPREHEND_BYTES) {
-            return redactLargeText(text, languageCode, confidenceThreshold, strategy);
         }
 
         DetectPiiEntitiesRequest request = DetectPiiEntitiesRequest.builder()
@@ -108,87 +86,64 @@ public class AwsComprehendRedactor implements AutoCloseable {
         DetectPiiEntitiesResponse response = comprehendClient.detectPiiEntities(request);
         List<PiiEntity> entities = new ArrayList<>(response.entities());
 
-        // Filter by confidence threshold
-        entities.removeIf(e -> e.score() == null || e.score() < confidenceThreshold);
+        // Filter entities by confidence threshold
+        entities.removeIf(entity -> entity.score() != null && entity.score() < this.scoreThreshold);
 
-        // Sort descending by beginOffset to safely replace without invalidating previous offsets
+        // Sort descending by beginOffset to safely replace substrings without shifting indices
         entities.sort(Comparator.comparingInt(PiiEntity::beginOffset).reversed());
 
-        StringBuilder sb = new StringBuilder(text);
-        int lastProcessedStart = Integer.MAX_VALUE;
+        StringBuilder redacted = new StringBuilder(text);
+        int lastProcessedBeginOffset = Integer.MAX_VALUE;
 
         for (PiiEntity entity : entities) {
-            int start = entity.beginOffset();
+            int begin = entity.beginOffset();
             int end = entity.endOffset();
 
-            // Skip overlapping or out-of-bounds entities
-            if (end > lastProcessedStart || start < 0 || end > sb.length()) {
+            // Guard against out-of-bounds or overlapping spans
+            if (begin < 0 || end > redacted.length() || begin >= end) {
                 continue;
             }
-            lastProcessedStart = start;
-
-            String replacement = createReplacement(entity, end - start, strategy);
-            sb.replace(start, end, replacement);
-        }
-
-        return sb.toString();
-    }
-
-    private String createReplacement(PiiEntity entity, int length, RedactionStrategy strategy) {
-        switch (strategy) {
-            case ASTERISKS:
-                StringBuilder stars = new StringBuilder();
-                for (int i = 0; i < length; i++) {
-                    stars.append('*');
-                }
-                return stars.toString();
-            case GENERIC_LABEL:
-                return "[REDACTED]";
-            case ENTITY_TYPE_LABEL:
-            default:
-                String typeName = entity.typeAsString() != null ? entity.typeAsString() : "PII";
-                return "[" + typeName + "]";
-        }
-    }
-
-    private String redactLargeText(String text, LanguageCode languageCode, float confidenceThreshold, RedactionStrategy strategy) {
-        String[] lines = text.split("(?<=\n)");
-        StringBuilder currentChunk = new StringBuilder();
-        StringBuilder result = new StringBuilder();
-
-        for (String line : lines) {
-            if ((currentChunk.toString() + line).getBytes(StandardCharsets.UTF_8).length >= MAX_AWS_COMPREHEND_BYTES) {
-                result.append(redact(currentChunk.toString(), languageCode, confidenceThreshold, strategy));
-                currentChunk.setLength(0);
+            if (end > lastProcessedBeginOffset) {
+                continue; // Skip overlapping entities to avoid corrupting text
             }
-            currentChunk.append(line);
+
+            String replacement;
+            switch (mode) {
+                case ENTITY_TYPE:
+                    replacement = "[" + entity.typeAsString() + "]";
+                    break;
+                case ASTERISKS:
+                    replacement = "*".repeat(end - begin);
+                    break;
+                case FIXED_MASK:
+                default:
+                    replacement = (customMask != null) ? customMask : "[REDACTED]";
+                    break;
+            }
+
+            redacted.replace(begin, end, replacement);
+            lastProcessedBeginOffset = begin;
         }
 
-        if (currentChunk.length() > 0) {
-            result.append(redact(currentChunk.toString(), languageCode, confidenceThreshold, strategy));
-        }
-
-        return result.toString();
+        return redacted.toString();
     }
 
     @Override
     public void close() {
-        if (manageClientLifecycle && comprehendClient != null) {
+        if (ownsClient && comprehendClient != null) {
             comprehendClient.close();
         }
     }
 }
 ```
 
-#### `src/test/java/com/edgechains/lib/utils/aws/AwsComprehendRedactorTest.java`
 ```java
-package com.edgechains.lib.utils.aws;
+package com.edgechains.lib.utils;
 
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.extension.ExtendWith;
-import org.mockito.Mock;
-import org.mockito.junit.jupiter.MockitoExtension;
+import org.mockito.Mockito;
 import software.amazon.awssdk.services.comprehend.ComprehendClient;
 import software.amazon.awssdk.services.comprehend.model.DetectPiiEntitiesRequest;
 import software.amazon.awssdk.services.comprehend.model.DetectPiiEntitiesResponse;
@@ -196,236 +151,75 @@ import software.amazon.awssdk.services.comprehend.model.LanguageCode;
 import software.amazon.awssdk.services.comprehend.model.PiiEntity;
 import software.amazon.awssdk.services.comprehend.model.PiiEntityType;
 
-import java.util.Arrays;
-import java.util.Collections;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.when;
 
-@ExtendWith(MockitoExtension.class)
 class AwsComprehendRedactorTest {
 
-    @Mock
-    private ComprehendClient comprehendClient;
-
+    private ComprehendClient mockClient;
     private AwsComprehendRedactor redactor;
 
     @BeforeEach
     void setUp() {
-        redactor = new AwsComprehendRedactor(comprehendClient);
+        mockClient = Mockito.mock(ComprehendClient.class);
+        redactor = new AwsComprehendRedactor(mockClient, 0.5f);
+    }
+
+    @AfterEach
+    void tearDown() {
+        redactor.close();
     }
 
     @Test
-    void testRedactEntityTypeLabel() {
-        String input = "Hello, my name is John Doe and my phone number is 123-456-7890.";
+    void testRedactEntityType() {
+        String input = "Hello, my email is test@example.com and phone is 555-0199.";
 
-        PiiEntity nameEntity = PiiEntity.builder()
-                .beginOffset(18)
-                .endOffset(26)
-                .type(PiiEntityType.NAME)
+        PiiEntity email = PiiEntity.builder()
+                .beginOffset(19)
+                .endOffset(35)
                 .score(0.99f)
+                .type(PiiEntityType.EMAIL)
                 .build();
 
-        PiiEntity phoneEntity = PiiEntity.builder()
+        PiiEntity phone = PiiEntity.builder()
                 .beginOffset(50)
-                .endOffset(62)
-                .type(PiiEntityType.PHONE)
+                .endOffset(58)
                 .score(0.95f)
+                .type(PiiEntityType.PHONE)
                 .build();
 
         DetectPiiEntitiesResponse response = DetectPiiEntitiesResponse.builder()
-                .entities(Arrays.asList(nameEntity, phoneEntity))
+                .entities(List.of(email, phone))
                 .build();
 
-        when(comprehendClient.detectPiiEntities(any(DetectPiiEntitiesRequest.class))).thenReturn(response);
+        when(mockClient.detectPiiEntities(any(DetectPiiEntitiesRequest.class))).thenReturn(response);
 
-        String result = redactor.redact(input, LanguageCode.EN, 0.8f, RedactionStrategy.ENTITY_TYPE_LABEL);
-        assertEquals("Hello, my name is [NAME] and my phone number is [PHONE].", result);
+        String result = redactor.redact(input, LanguageCode.EN, AwsComprehendRedactor.RedactionMode.ENTITY_TYPE);
+        assertEquals("Hello, my email is [EMAIL] and phone is [PHONE].", result);
     }
 
     @Test
-    void testRedactGenericLabel() {
-        String input = "Secret token: ABC-12345";
+    void testRedactFixedMask() {
+        String input = "Contact John Doe immediately.";
 
-        PiiEntity ssnEntity = PiiEntity.builder()
-                .beginOffset(14)
-                .endOffset(23)
-                .type(PiiEntityType.AWS_ACCESS_KEY)
-                .score(0.92f)
-                .build();
-
-        DetectPiiEntitiesResponse response = DetectPiiEntitiesResponse.builder()
-                .entities(Collections.singletonList(ssnEntity))
-                .build();
-
-        when(comprehendClient.detectPiiEntities(any(DetectPiiEntitiesRequest.class))).thenReturn(response);
-
-        String result = redactor.redact(input, LanguageCode.EN, 0.8f, RedactionStrategy.GENERIC_LABEL);
-        assertEquals("Secret token: [REDACTED]", result);
-    }
-
-    @Test
-    void testLowConfidenceIgnored() {
-        String input = "Contact Jane Doe.";
-
-        PiiEntity lowConfidence = PiiEntity.builder()
+        PiiEntity name = PiiEntity.builder()
                 .beginOffset(8)
                 .endOffset(16)
+                .score(0.98f)
                 .type(PiiEntityType.NAME)
-                .score(0.40f)
                 .build();
 
         DetectPiiEntitiesResponse response = DetectPiiEntitiesResponse.builder()
-                .entities(Collections.singletonList(lowConfidence))
+                .entities(List.of(name))
                 .build();
 
-        when(comprehendClient.detectPiiEntities(any(DetectPiiEntitiesRequest.class))).thenReturn(response);
+        when(mockClient.detectPiiEntities(any(DetectPiiEntitiesRequest.class))).thenReturn(response);
 
-        String result = redactor.redact(input, LanguageCode.EN, 0.8f, RedactionStrategy.ENTITY_TYPE_LABEL);
-        assertEquals("Contact Jane Doe.", result);
+        String result = redactor.redact(input, LanguageCode.EN, AwsComprehendRedactor.RedactionMode.FIXED_MASK, "[CONFIDENTIAL]");
+        assertEquals("Contact [CONFIDENTIAL] immediately.", result);
     }
 }
-```
-
----
-
-### 2. BAWES Universe: Mobile App Foundation (Android + iOS)
-
-#### `package.json`
-```json
-{
-  "name": "bawes-universe-mobile",
-  "version": "1.0.0",
-  "private": true,
-  "scripts": {
-    "dev": "vite",
-    "build": "vite build",
-    "sync": "cap sync",
-    "open:android": "cap open android",
-    "open:ios": "cap open ios"
-  },
-  "dependencies": {
-    "@capacitor/android": "^5.7.0",
-    "@capacitor/core": "^5.7.0",
-    "@capacitor/ios": "^5.7.0",
-    "@capacitor/screen-orientation": "^5.0.7",
-    "@capacitor/status-bar": "^5.0.7",
-    "react": "^18.2.0",
-    "react-dom": "^18.2.0"
-  },
-  "devDependencies": {
-    "@capacitor/cli": "^5.7.0",
-    "@vitejs/plugin-react": "^4.2.1",
-    "typescript": "^5.3.3",
-    "vite": "^5.1.4"
-  }
-}
-```
-
-#### `capacitor.config.ts`
-```typescript
-import { CapacitorConfig } from '@capacitor/cli';
-
-const config: CapacitorConfig = {
-  appId: 'com.bawes.universe',
-  appName: 'BAWES Universe',
-  webDir: 'dist',
-  server: {
-    androidScheme: 'https',
-    allowNavigation: ['workadventure.bawes.net', '*.workadventure.localhost']
-  },
-  plugins: {
-    StatusBar: {
-      overlaysWebView: true
-    }
-  }
-};
-
-export default config;
-```
-
-#### `src/App.tsx`
-```tsx
-import React, { useEffect, useRef, useState } from 'react';
-import { ScreenOrientation } from '@capacitor/screen-orientation';
-import { StatusBar, Style } from '@capacitor/status-bar';
-
-const WORKADVENTURE_UNIVERSE_URL =
-  import.meta.env.VITE_WA_URL || 'https://workadventure.bawes.net';
-
-export const App: React.FC = () => {
-  const iframeRef = useRef<HTMLIFrameElement>(null);
-  const [hasPermissions, setHasPermissions] = useState<boolean>(false);
-
-  useEffect(() => {
-    async function initMobileFeatures() {
-      try {
-        await StatusBar.setStyle({ style: Style.Dark });
-        await ScreenOrientation.unlock();
-      } catch (e) {
-        console.warn('Mobile native API unavailable in standard browser', e);
-      }
-
-      // Request media permissions for WebRTC proximity audio/video in WorkAdventure
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
-        stream.getTracks().forEach((track) => track.stop());
-        setHasPermissions(true);
-      } catch {
-        setHasPermissions(false);
-      }
-    }
-
-    initMobileFeatures();
-  }, []);
-
-  return (
-    <div style={containerStyle}>
-      <iframe
-        ref={iframeRef}
-        src={WORKADVENTURE_UNIVERSE_URL}
-        style={iframeStyle}
-        allow="camera; microphone; display-capture; autoplay; clipboard-write;"
-        title="BAWES Universe"
-      />
-    </div>
-  );
-};
-
-const containerStyle: React.CSSProperties = {
-  width: '100vw',
-  height: '100vh',
-  overflow: 'hidden',
-  backgroundColor: '#000',
-  margin: 0,
-  padding: 0,
-};
-
-const iframeStyle: React.CSSProperties = {
-  width: '100%',
-  height: '100%',
-  border: 'none',
-  display: 'block',
-};
-
-export default App;
-```
-
-#### `android/app/src/main/AndroidManifest.xml` (Permissions excerpt)
-```xml
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <uses-permission android:name="android.permission.INTERNET" />
-    <uses-permission android:name="android.permission.CAMERA" />
-    <uses-permission android:name="android.permission.RECORD_AUDIO" />
-    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
-</manifest>
-```
-
-#### `ios/App/App/Info.plist` (Permissions excerpt)
-```xml
-<key>NSCameraUsageDescription</key>
-<string>BAWES Universe uses your camera for proximity video chat.</string>
-<key>NSMicrophoneUsageDescription</key>
-<string>BAWES Universe uses your microphone for proximity audio chat.</string>
 ```
