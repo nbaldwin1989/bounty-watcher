@@ -1,205 +1,212 @@
-```javascript
-// index.js
-import { Octokit } from "@octokit/rest";
-
-const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
-const GITHUB_REPOSITORY = process.env.GITHUB_REPOSITORY;
-const USERNAME = process.env.ALGORA_USER || process.env.GITHUB_USER || GITHUB_REPOSITORY?.split("/")[0];
-const ALGORA_API_URL = process.env.ALGORA_API_URL || "https://api.algora.io/bounties";
-
-if (!GITHUB_TOKEN || !GITHUB_REPOSITORY) {
-  console.error("Missing required environment variables: GITHUB_TOKEN, GITHUB_REPOSITORY");
-  process.exit(1);
-}
-
-const [owner, repo] = GITHUB_REPOSITORY.split("/");
-const octokit = new Octokit({ auth: GITHUB_TOKEN });
-
-const TAG_REGEX = /<!--\s*algora:([a-zA-Z0-9_\-]+)\s*-->/g;
-
-async function fetchTrackedBountyIds() {
-  const trackedIds = new Set();
-  let page = 1;
-  const perPage = 100;
-
-  // Retrieve all existing issues (open and closed) to prevent duplicates
-  while (true) {
-    const { data: issues } = await octokit.rest.issues.listForRepo({
-      owner,
-      repo,
-      state: "all",
-      per_page: perPage,
-      page,
-    });
-
-    for (const issue of issues) {
-      if (issue.pull_request) continue;
-      if (!issue.body) continue;
-
-      let match;
-      while ((match = TAG_REGEX.exec(issue.body)) !== null) {
-        trackedIds.add(match[1]);
-      }
-    }
-
-    if (issues.length < perPage) break;
-    page++;
-  }
-
-  return trackedIds;
-}
-
-async function fetchOpenBounties() {
-  const response = await fetch(ALGORA_API_URL);
-  if (!response.ok) {
-    throw new Error(`Failed to fetch bounties from Algora: ${response.status} ${response.statusText}`);
-  }
-  const data = await response.json();
-  const bounties = Array.isArray(data) ? data : data.items || data.bounties || [];
-  return bounties.filter((b) => b.status === "open" || b.state === "open" || !b.status);
-}
-
-function formatReward(bounty) {
-  if (bounty.reward_formatted) return bounty.reward_formatted;
-  if (typeof bounty.amount === "number") return `$${bounty.amount / 100}`;
-  if (bounty.amount) return `$${bounty.amount}`;
-  return "Bounty";
-}
-
-function getBountyId(bounty) {
-  return String(bounty.id || bounty.slug || bounty.issue_id);
-}
-
-function getBountyUrl(bounty) {
-  return bounty.url || bounty.html_url || bounty.issue_url || "";
-}
-
-async function run() {
-  const trackedIds = await fetchTrackedBountyIds();
-  const openBounties = await fetchOpenBounties();
-
-  const isFirstRun = trackedIds.size === 0;
-
-  if (isFirstRun) {
-    if (openBounties.length === 0) {
-      console.log("First run, but no open bounties found.");
-      return;
-    }
-
-    console.log(`First run: Initializing with ${openBounties.length} open bounties.`);
-
-    const bountyLines = openBounties.map((b) => {
-      const reward = formatReward(b);
-      const url = getBountyUrl(b);
-      return `- 🔴 **${reward}** · [${b.title}](${url})`;
-    });
-
-    const tags = openBounties.map((b) => `<!-- algora:${getBountyId(b)} -->`);
-    const mention = USERNAME ? `\n\ncc @${USERNAME}` : "";
-
-    const body = [
-      "Bounties that were already open when the watcher started. From now on, each new one gets its own issue.\n",
-      bountyLines.join("\n"),
-      mention,
-      "\n" + tags.join("\n"),
-    ].join("");
-
-    await octokit.rest.issues.create({
-      owner,
-      repo,
-      title: "Open bounties",
-      body,
-    });
-
-    console.log("Created initial summary issue.");
-    return;
-  }
-
-  // Subsequent runs: Create individual issues for newly discovered bounties
-  const newBounties = openBounties.filter((b) => !trackedIds.has(getBountyId(b)));
-
-  console.log(`Found ${newBounties.length} new bounties.`);
-
-  for (const bounty of newBounties) {
-    const reward = formatReward(bounty);
-    const url = getBountyUrl(bounty);
-    const id = getBountyId(bounty);
-    const mention = USERNAME ? `\n\ncc @${USERNAME}` : "";
-
-    const title = `[${reward}] ${bounty.title}`;
-    const body = [
-      `### [${bounty.title}](${url})\n`,
-      `Reward: **${reward}**\n`,
-      bounty.description ? `${bounty.description}\n` : "",
-      mention,
-      `\n<!-- algora:${id} -->`,
-    ].join("");
-
-    await octokit.rest.issues.create({
-      owner,
-      repo,
-      title,
-      body,
-    });
-
-    console.log(`Created issue for bounty: ${title}`);
-  }
-}
-
-run().catch((error) => {
-  console.error("Watcher failed:", error);
-  process.exit(1);
-});
+```xml
+<!-- Dependency: Add to pom.xml -->
+<dependency>
+    <groupId>software.amazon.awssdk</groupId>
+    <artifactId>comprehend</artifactId>
+    <version>2.25.16</version>
+</dependency>
 ```
 
-```json
-// package.json
-{
-  "name": "algora-bounty-watcher",
-  "version": "1.0.0",
-  "type": "module",
-  "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
-  },
-  "dependencies": {
-    "@octokit/rest": "^20.0.2"
-  }
+```java
+package org.arakoodev.edgechains.utils;
+
+import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.comprehend.ComprehendClient;
+import software.amazon.awssdk.services.comprehend.model.DetectPiiEntitiesRequest;
+import software.amazon.awssdk.services.comprehend.model.DetectPiiEntitiesResponse;
+import software.amazon.awssdk.services.comprehend.model.PiiEntity;
+
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+
+/**
+ * Utility to detect and redact Personally Identifiable Information (PII)
+ * using AWS Comprehend before passing text into EdgeChains prompts or chains.
+ */
+public class AwsComprehendRedactor {
+
+    private final ComprehendClient comprehendClient;
+    private final String defaultLanguageCode;
+
+    public AwsComprehendRedactor() {
+        this(ComprehendClient.builder()
+                .credentialsProvider(DefaultCredentialsProvider.create())
+                .region(Region.US_EAST_1)
+                .build(), "en");
+    }
+
+    public AwsComprehendRedactor(Region region) {
+        this(ComprehendClient.builder()
+                .credentialsProvider(DefaultCredentialsProvider.create())
+                .region(region)
+                .build(), "en");
+    }
+
+    public AwsComprehendRedactor(ComprehendClient comprehendClient, String defaultLanguageCode) {
+        this.comprehendClient = comprehendClient;
+        this.defaultLanguageCode = defaultLanguageCode;
+    }
+
+    /**
+     * Redacts PII entities by masking each detected entity with its type, e.g., [SSN], [EMAIL].
+     *
+     * @param text Raw input text.
+     * @return Redacted text.
+     */
+    public String redact(String text) {
+        return redact(text, this.defaultLanguageCode);
+    }
+
+    /**
+     * Redacts PII entities using a custom mask format with the entity type name.
+     *
+     * @param text         Raw input text.
+     * @param languageCode Language code (e.g., "en", "es").
+     * @return Redacted text.
+     */
+    public String redact(String text, String languageCode) {
+        if (text == null || text.trim().isEmpty()) {
+            return text;
+        }
+
+        List<PiiEntity> entities = detectEntities(text, languageCode);
+        return applyRedaction(text, entities, null);
+    }
+
+    /**
+     * Redacts PII entities using a static placeholder mask across all entity types.
+     *
+     * @param text Raw input text.
+     * @param mask Custom replacement string (e.g. "[REDACTED]" or "***").
+     * @return Redacted text.
+     */
+    public String redactWithMask(String text, String mask) {
+        return redactWithMask(text, this.defaultLanguageCode, mask);
+    }
+
+    /**
+     * Redacts PII entities using a static placeholder mask for a specified language.
+     *
+     * @param text         Raw input text.
+     * @param languageCode Language code.
+     * @param mask         Custom replacement string.
+     * @return Redacted text.
+     */
+    public String redactWithMask(String text, String languageCode, String mask) {
+        if (text == null || text.trim().isEmpty()) {
+            return text;
+        }
+
+        List<PiiEntity> entities = detectEntities(text, languageCode);
+        return applyRedaction(text, entities, mask);
+    }
+
+    /**
+     * Fetches all detected PII entities from AWS Comprehend.
+     *
+     * @param text         Input text.
+     * @param languageCode Language code.
+     * @return List of detected PiiEntity instances.
+     */
+    public List<PiiEntity> detectEntities(String text, String languageCode) {
+        DetectPiiEntitiesRequest request = DetectPiiEntitiesRequest.builder()
+                .text(text)
+                .languageCode(languageCode)
+                .build();
+
+        DetectPiiEntitiesResponse response = comprehendClient.detectPiiEntities(request);
+        return new ArrayList<>(response.entities());
+    }
+
+    private String applyRedaction(String text, List<PiiEntity> entities, String customMask) {
+        // Sort descending by beginOffset to safely replace substrings without invalidating offsets
+        entities.sort(Comparator.comparingInt(PiiEntity::beginOffset).reversed());
+
+        StringBuilder sb = new StringBuilder(text);
+        for (PiiEntity entity : entities) {
+            int start = entity.beginOffset();
+            int end = entity.endOffset();
+            String replacement = (customMask != null) ? customMask : "[" + entity.typeAsString() + "]";
+            sb.replace(start, end, replacement);
+        }
+
+        return sb.toString();
+    }
 }
 ```
 
-```yaml
-# .github/workflows/watcher.yml
-name: Bounty Watcher
+```java
+package org.arakoodev.edgechains.utils;
 
-on:
-  schedule:
-    - cron: "0 * * * *" # Runs every hour
-  workflow_dispatch:
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
+import software.amazon.awssdk.services.comprehend.ComprehendClient;
+import software.amazon.awssdk.services.comprehend.model.DetectPiiEntitiesRequest;
+import software.amazon.awssdk.services.comprehend.model.DetectPiiEntitiesResponse;
+import software.amazon.awssdk.services.comprehend.model.PiiEntity;
+import software.amazon.awssdk.services.comprehend.model.PiiEntityType;
 
-jobs:
-  watch:
-    runs-on: ubuntu-latest
-    permissions:
-      issues: write
-      contents: read
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+import java.util.List;
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: "npm"
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.when;
 
-      - name: Install dependencies
-        run: npm ci
+class AwsComprehendRedactorTest {
 
-      - name: Run bounty watcher
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          ALGORA_USER: ${{ github.repository_owner }}
-        run: npm start
+    private ComprehendClient mockClient;
+    private AwsComprehendRedactor redactor;
+
+    @BeforeEach
+    void setUp() {
+        mockClient = Mockito.mock(ComprehendClient.class);
+        redactor = new AwsComprehendRedactor(mockClient, "en");
+    }
+
+    @Test
+    void testRedactEntityTypeMask() {
+        String input = "Contact John Doe at john@example.com or call 555-1234.";
+
+        PiiEntity email = PiiEntity.builder()
+                .type(PiiEntityType.EMAIL)
+                .beginOffset(20)
+                .endOffset(36)
+                .score(0.99f)
+                .build();
+
+        PiiEntity phone = PiiEntity.builder()
+                .type(PiiEntityType.PHONE)
+                .beginOffset(45)
+                .endOffset(53)
+                .score(0.99f)
+                .build();
+
+        when(mockClient.detectPiiEntities(any(DetectPiiEntitiesRequest.class)))
+                .thenReturn(DetectPiiEntitiesResponse.builder().entities(List.of(email, phone)).build());
+
+        String result = redactor.redact(input);
+        assertEquals("Contact John Doe at [EMAIL] or call [PHONE].", result);
+    }
+
+    @Test
+    void testRedactWithCustomMask() {
+        String input = "My email is test@test.com";
+
+        PiiEntity email = PiiEntity.builder()
+                .type(PiiEntityType.EMAIL)
+                .beginOffset(12)
+                .endOffset(25)
+                .score(0.99f)
+                .build();
+
+        when(mockClient.detectPiiEntities(any(DetectPiiEntitiesRequest.class)))
+                .thenReturn(DetectPiiEntitiesResponse.builder().entities(List.of(email)).build());
+
+        String result = redactor.redactWithMask(input, "[REDACTED]");
+        assertEquals("My email is [REDACTED]", result);
+    }
+}
 ```
