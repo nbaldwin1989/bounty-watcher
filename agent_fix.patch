@@ -1,225 +1,205 @@
-```java
-package com.edgechains.lib.utils;
+```javascript
+// index.js
+import { Octokit } from "@octokit/rest";
 
-import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
-import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
-import software.amazon.awssdk.regions.Region;
-import software.amazon.awssdk.services.comprehend.ComprehendClient;
-import software.amazon.awssdk.services.comprehend.model.DetectPiiEntitiesRequest;
-import software.amazon.awssdk.services.comprehend.model.DetectPiiEntitiesResponse;
-import software.amazon.awssdk.services.comprehend.model.LanguageCode;
-import software.amazon.awssdk.services.comprehend.model.PiiEntity;
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+const GITHUB_REPOSITORY = process.env.GITHUB_REPOSITORY;
+const USERNAME = process.env.ALGORA_USER || process.env.GITHUB_USER || GITHUB_REPOSITORY?.split("/")[0];
+const ALGORA_API_URL = process.env.ALGORA_API_URL || "https://api.algora.io/bounties";
 
-import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.List;
-import java.util.Objects;
+if (!GITHUB_TOKEN || !GITHUB_REPOSITORY) {
+  console.error("Missing required environment variables: GITHUB_TOKEN, GITHUB_REPOSITORY");
+  process.exit(1);
+}
 
-/**
- * Utility for detecting and redacting Personally Identifiable Information (PII)
- * using AWS Comprehend.
- */
-public class AwsComprehendRedactor implements AutoCloseable {
+const [owner, repo] = GITHUB_REPOSITORY.split("/");
+const octokit = new Octokit({ auth: GITHUB_TOKEN });
 
-    private final ComprehendClient comprehendClient;
-    private final boolean ownsClient;
-    private final float scoreThreshold;
+const TAG_REGEX = /<!--\s*algora:([a-zA-Z0-9_\-]+)\s*-->/g;
 
-    public enum RedactionMode {
-        ENTITY_TYPE, // Replaces with entity type tag, e.g., [EMAIL], [NAME]
-        FIXED_MASK,   // Replaces with fixed string, e.g., [REDACTED]
-        ASTERISKS     // Replaces matching characters with asterisks, e.g., ****
+async function fetchTrackedBountyIds() {
+  const trackedIds = new Set();
+  let page = 1;
+  const perPage = 100;
+
+  // Retrieve all existing issues (open and closed) to prevent duplicates
+  while (true) {
+    const { data: issues } = await octokit.rest.issues.listForRepo({
+      owner,
+      repo,
+      state: "all",
+      per_page: perPage,
+      page,
+    });
+
+    for (const issue of issues) {
+      if (issue.pull_request) continue;
+      if (!issue.body) continue;
+
+      let match;
+      while ((match = TAG_REGEX.exec(issue.body)) !== null) {
+        trackedIds.add(match[1]);
+      }
     }
 
-    public AwsComprehendRedactor() {
-        this(Region.US_EAST_1, DefaultCredentialsProvider.create(), 0.5f);
+    if (issues.length < perPage) break;
+    page++;
+  }
+
+  return trackedIds;
+}
+
+async function fetchOpenBounties() {
+  const response = await fetch(ALGORA_API_URL);
+  if (!response.ok) {
+    throw new Error(`Failed to fetch bounties from Algora: ${response.status} ${response.statusText}`);
+  }
+  const data = await response.json();
+  const bounties = Array.isArray(data) ? data : data.items || data.bounties || [];
+  return bounties.filter((b) => b.status === "open" || b.state === "open" || !b.status);
+}
+
+function formatReward(bounty) {
+  if (bounty.reward_formatted) return bounty.reward_formatted;
+  if (typeof bounty.amount === "number") return `$${bounty.amount / 100}`;
+  if (bounty.amount) return `$${bounty.amount}`;
+  return "Bounty";
+}
+
+function getBountyId(bounty) {
+  return String(bounty.id || bounty.slug || bounty.issue_id);
+}
+
+function getBountyUrl(bounty) {
+  return bounty.url || bounty.html_url || bounty.issue_url || "";
+}
+
+async function run() {
+  const trackedIds = await fetchTrackedBountyIds();
+  const openBounties = await fetchOpenBounties();
+
+  const isFirstRun = trackedIds.size === 0;
+
+  if (isFirstRun) {
+    if (openBounties.length === 0) {
+      console.log("First run, but no open bounties found.");
+      return;
     }
 
-    public AwsComprehendRedactor(Region region, AwsCredentialsProvider credentialsProvider, float scoreThreshold) {
-        this.comprehendClient = ComprehendClient.builder()
-                .region(region)
-                .credentialsProvider(credentialsProvider)
-                .build();
-        this.ownsClient = true;
-        this.scoreThreshold = scoreThreshold;
-    }
+    console.log(`First run: Initializing with ${openBounties.length} open bounties.`);
 
-    public AwsComprehendRedactor(ComprehendClient comprehendClient, float scoreThreshold) {
-        this.comprehendClient = Objects.requireNonNull(comprehendClient, "comprehendClient must not be null");
-        this.ownsClient = false;
-        this.scoreThreshold = scoreThreshold;
-    }
+    const bountyLines = openBounties.map((b) => {
+      const reward = formatReward(b);
+      const url = getBountyUrl(b);
+      return `- 🔴 **${reward}** · [${b.title}](${url})`;
+    });
 
-    /**
-     * Redacts PII from text using default EN language and ENTITY_TYPE mode.
-     */
-    public String redact(String text) {
-        return redact(text, LanguageCode.EN, RedactionMode.ENTITY_TYPE, "[REDACTED]");
-    }
+    const tags = openBounties.map((b) => `<!-- algora:${getBountyId(b)} -->`);
+    const mention = USERNAME ? `\n\ncc @${USERNAME}` : "";
 
-    /**
-     * Redacts PII with specified language code and redaction mode.
-     */
-    public String redact(String text, LanguageCode languageCode, RedactionMode mode) {
-        return redact(text, languageCode, mode, "[REDACTED]");
-    }
+    const body = [
+      "Bounties that were already open when the watcher started. From now on, each new one gets its own issue.\n",
+      bountyLines.join("\n"),
+      mention,
+      "\n" + tags.join("\n"),
+    ].join("");
 
-    /**
-     * Redacts PII with full configuration.
-     *
-     * @param text         Raw input text containing potential PII.
-     * @param languageCode Language of the input text.
-     * @param mode         Strategy to use for replacing detected entities.
-     * @param customMask   Fallback mask string when FIXED_MASK mode is used.
-     * @return Redacted text.
-     */
-    public String redact(String text, LanguageCode languageCode, RedactionMode mode, String customMask) {
-        if (text == null || text.trim().isEmpty()) {
-            return text;
-        }
+    await octokit.rest.issues.create({
+      owner,
+      repo,
+      title: "Open bounties",
+      body,
+    });
 
-        DetectPiiEntitiesRequest request = DetectPiiEntitiesRequest.builder()
-                .text(text)
-                .languageCode(languageCode)
-                .build();
+    console.log("Created initial summary issue.");
+    return;
+  }
 
-        DetectPiiEntitiesResponse response = comprehendClient.detectPiiEntities(request);
-        List<PiiEntity> entities = new ArrayList<>(response.entities());
+  // Subsequent runs: Create individual issues for newly discovered bounties
+  const newBounties = openBounties.filter((b) => !trackedIds.has(getBountyId(b)));
 
-        // Filter entities by confidence threshold
-        entities.removeIf(entity -> entity.score() != null && entity.score() < this.scoreThreshold);
+  console.log(`Found ${newBounties.length} new bounties.`);
 
-        // Sort descending by beginOffset to safely replace substrings without shifting indices
-        entities.sort(Comparator.comparingInt(PiiEntity::beginOffset).reversed());
+  for (const bounty of newBounties) {
+    const reward = formatReward(bounty);
+    const url = getBountyUrl(bounty);
+    const id = getBountyId(bounty);
+    const mention = USERNAME ? `\n\ncc @${USERNAME}` : "";
 
-        StringBuilder redacted = new StringBuilder(text);
-        int lastProcessedBeginOffset = Integer.MAX_VALUE;
+    const title = `[${reward}] ${bounty.title}`;
+    const body = [
+      `### [${bounty.title}](${url})\n`,
+      `Reward: **${reward}**\n`,
+      bounty.description ? `${bounty.description}\n` : "",
+      mention,
+      `\n<!-- algora:${id} -->`,
+    ].join("");
 
-        for (PiiEntity entity : entities) {
-            int begin = entity.beginOffset();
-            int end = entity.endOffset();
+    await octokit.rest.issues.create({
+      owner,
+      repo,
+      title,
+      body,
+    });
 
-            // Guard against out-of-bounds or overlapping spans
-            if (begin < 0 || end > redacted.length() || begin >= end) {
-                continue;
-            }
-            if (end > lastProcessedBeginOffset) {
-                continue; // Skip overlapping entities to avoid corrupting text
-            }
+    console.log(`Created issue for bounty: ${title}`);
+  }
+}
 
-            String replacement;
-            switch (mode) {
-                case ENTITY_TYPE:
-                    replacement = "[" + entity.typeAsString() + "]";
-                    break;
-                case ASTERISKS:
-                    replacement = "*".repeat(end - begin);
-                    break;
-                case FIXED_MASK:
-                default:
-                    replacement = (customMask != null) ? customMask : "[REDACTED]";
-                    break;
-            }
+run().catch((error) => {
+  console.error("Watcher failed:", error);
+  process.exit(1);
+});
+```
 
-            redacted.replace(begin, end, replacement);
-            lastProcessedBeginOffset = begin;
-        }
-
-        return redacted.toString();
-    }
-
-    @Override
-    public void close() {
-        if (ownsClient && comprehendClient != null) {
-            comprehendClient.close();
-        }
-    }
+```json
+// package.json
+{
+  "name": "algora-bounty-watcher",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@octokit/rest": "^20.0.2"
+  }
 }
 ```
 
-```java
-package com.edgechains.lib.utils;
+```yaml
+# .github/workflows/watcher.yml
+name: Bounty Watcher
 
-import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Test;
-import org.mockito.Mockito;
-import software.amazon.awssdk.services.comprehend.ComprehendClient;
-import software.amazon.awssdk.services.comprehend.model.DetectPiiEntitiesRequest;
-import software.amazon.awssdk.services.comprehend.model.DetectPiiEntitiesResponse;
-import software.amazon.awssdk.services.comprehend.model.LanguageCode;
-import software.amazon.awssdk.services.comprehend.model.PiiEntity;
-import software.amazon.awssdk.services.comprehend.model.PiiEntityType;
+on:
+  schedule:
+    - cron: "0 * * * *" # Runs every hour
+  workflow_dispatch:
 
-import java.util.List;
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.Mockito.when;
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: "npm"
 
-class AwsComprehendRedactorTest {
+      - name: Install dependencies
+        run: npm ci
 
-    private ComprehendClient mockClient;
-    private AwsComprehendRedactor redactor;
-
-    @BeforeEach
-    void setUp() {
-        mockClient = Mockito.mock(ComprehendClient.class);
-        redactor = new AwsComprehendRedactor(mockClient, 0.5f);
-    }
-
-    @AfterEach
-    void tearDown() {
-        redactor.close();
-    }
-
-    @Test
-    void testRedactEntityType() {
-        String input = "Hello, my email is test@example.com and phone is 555-0199.";
-
-        PiiEntity email = PiiEntity.builder()
-                .beginOffset(19)
-                .endOffset(35)
-                .score(0.99f)
-                .type(PiiEntityType.EMAIL)
-                .build();
-
-        PiiEntity phone = PiiEntity.builder()
-                .beginOffset(50)
-                .endOffset(58)
-                .score(0.95f)
-                .type(PiiEntityType.PHONE)
-                .build();
-
-        DetectPiiEntitiesResponse response = DetectPiiEntitiesResponse.builder()
-                .entities(List.of(email, phone))
-                .build();
-
-        when(mockClient.detectPiiEntities(any(DetectPiiEntitiesRequest.class))).thenReturn(response);
-
-        String result = redactor.redact(input, LanguageCode.EN, AwsComprehendRedactor.RedactionMode.ENTITY_TYPE);
-        assertEquals("Hello, my email is [EMAIL] and phone is [PHONE].", result);
-    }
-
-    @Test
-    void testRedactFixedMask() {
-        String input = "Contact John Doe immediately.";
-
-        PiiEntity name = PiiEntity.builder()
-                .beginOffset(8)
-                .endOffset(16)
-                .score(0.98f)
-                .type(PiiEntityType.NAME)
-                .build();
-
-        DetectPiiEntitiesResponse response = DetectPiiEntitiesResponse.builder()
-                .entities(List.of(name))
-                .build();
-
-        when(mockClient.detectPiiEntities(any(DetectPiiEntitiesRequest.class))).thenReturn(response);
-
-        String result = redactor.redact(input, LanguageCode.EN, AwsComprehendRedactor.RedactionMode.FIXED_MASK, "[CONFIDENTIAL]");
-        assertEquals("Contact [CONFIDENTIAL] immediately.", result);
-    }
-}
+      - name: Run bounty watcher
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          ALGORA_USER: ${{ github.repository_owner }}
+        run: npm start
 ```
