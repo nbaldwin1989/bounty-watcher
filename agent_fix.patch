@@ -1,280 +1,213 @@
 ```java
-package com.edgechains.lib.aws;
+package com.edgechain.lib.aws;
 
-import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
-import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.comprehend.ComprehendClient;
 import software.amazon.awssdk.services.comprehend.model.DetectPiiEntitiesRequest;
 import software.amazon.awssdk.services.comprehend.model.DetectPiiEntitiesResponse;
 import software.amazon.awssdk.services.comprehend.model.LanguageCode;
 import software.amazon.awssdk.services.comprehend.model.PiiEntity;
-import software.amazon.awssdk.services.comprehend.model.PiiEntityType;
 
-import java.nio.charset.StandardCharsets;
-import java.util.*;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Objects;
 import java.util.stream.Collectors;
 
 /**
- * Utility to detect and redact Personally Identifiable Information (PII)
- * using AWS Comprehend.
+ * Utility and Service class for integrating AWS Comprehend to detect and redact
+ * Personally Identifiable Information (PII) from text data.
  */
-public class AwsComprehendRedactor implements AutoCloseable {
+public class AwsComprehendRedactionService {
 
-    private static final int MAX_BYTE_SIZE = 95_000; // AWS Comprehend limit is 100 KB
     private final ComprehendClient comprehendClient;
-    private final boolean ownsClient;
+    private final LanguageCode defaultLanguageCode;
 
-    public enum RedactionMode {
-        REPLACE_WITH_TAG,      // e.g., "[REDACTED]"
-        REPLACE_WITH_TYPE,     // e.g., "[EMAIL]", "[NAME]"
-        MASK_CHARACTERS        // e.g., "********"
+    public enum RedactionMaskType {
+        ENTITY_TYPE,    // e.g., [NAME], [EMAIL], [SSN]
+        GENERIC_MASK,   // e.g., [REDACTED]
+        ASTERISKS       // e.g., ********
     }
 
-    public static class RedactionConfig {
-        private RedactionMode mode = RedactionMode.REPLACE_WITH_TYPE;
-        private String defaultPlaceholder = "[REDACTED]";
-        private char maskChar = '*';
-        private float minConfidenceScore = 0.5f;
-        private LanguageCode languageCode = LanguageCode.EN;
-        private Set<PiiEntityType> targetTypes = Collections.emptySet(); // Empty means all
-
-        public static RedactionConfig defaultConfig() {
-            return new RedactionConfig();
-        }
-
-        public RedactionConfig mode(RedactionMode mode) {
-            this.mode = mode;
-            return this;
-        }
-
-        public RedactionConfig defaultPlaceholder(String placeholder) {
-            this.defaultPlaceholder = placeholder;
-            return this;
-        }
-
-        public RedactionConfig maskChar(char maskChar) {
-            this.maskChar = maskChar;
-            return this;
-        }
-
-        public RedactionConfig minConfidenceScore(float score) {
-            this.minConfidenceScore = score;
-            return this;
-        }
-
-        public RedactionConfig languageCode(LanguageCode code) {
-            this.languageCode = code;
-            return this;
-        }
-
-        public RedactionConfig targetTypes(Set<PiiEntityType> targetTypes) {
-            this.targetTypes = targetTypes != null ? targetTypes : Collections.emptySet();
-            return this;
-        }
+    public AwsComprehendRedactionService(ComprehendClient comprehendClient) {
+        this(comprehendClient, LanguageCode.EN);
     }
 
-    public static class PiiSpan {
-        private final int beginOffset;
-        private final int endOffset;
-        private final String type;
-        private final float score;
-
-        public PiiSpan(int beginOffset, int endOffset, String type, float score) {
-            this.beginOffset = beginOffset;
-            this.endOffset = endOffset;
-            this.type = type;
-            this.score = score;
-        }
-
-        public int getBeginOffset() { return beginOffset; }
-        public int getEndOffset() { return endOffset; }
-        public String getType() { return type; }
-        public float getScore() { return score; }
-    }
-
-    public AwsComprehendRedactor(ComprehendClient comprehendClient) {
+    public AwsComprehendRedactionService(ComprehendClient comprehendClient, LanguageCode defaultLanguageCode) {
         this.comprehendClient = Objects.requireNonNull(comprehendClient, "comprehendClient must not be null");
-        this.ownsClient = false;
+        this.defaultLanguageCode = defaultLanguageCode != null ? defaultLanguageCode : LanguageCode.EN;
     }
 
-    public AwsComprehendRedactor(Region region) {
-        this(region, DefaultCredentialsProvider.create());
-    }
-
-    public AwsComprehendRedactor(Region region, AwsCredentialsProvider credentialsProvider) {
-        this.comprehendClient = ComprehendClient.builder()
+    public static AwsComprehendRedactionService create(String accessKey, String secretKey, Region region) {
+        ComprehendClient client = ComprehendClient.builder()
                 .region(region)
-                .credentialsProvider(credentialsProvider)
+                .credentialsProvider(StaticCredentialsProvider.create(
+                        AwsBasicCredentials.create(accessKey, secretKey)))
                 .build();
-        this.ownsClient = true;
+        return new AwsComprehendRedactionService(client);
     }
 
     /**
-     * Redacts PII in the input text using the default configuration.
+     * Detects PII entities in the provided text using the default language code.
      */
-    public String redact(String text) {
-        return redact(text, RedactionConfig.defaultConfig());
+    public List<PiiEntity> detectPiiEntities(String text) {
+        return detectPiiEntities(text, this.defaultLanguageCode);
     }
 
     /**
-     * Redacts PII in the input text using a customized configuration.
+     * Detects PII entities in the provided text for a specific language code.
      */
-    public String redact(String text, RedactionConfig config) {
-        if (text == null || text.isEmpty()) {
-            return text;
-        }
-        if (config == null) {
-            config = RedactionConfig.defaultConfig();
-        }
-
-        List<String> chunks = splitText(text, MAX_BYTE_SIZE);
-        StringBuilder result = new StringBuilder();
-
-        for (String chunk : chunks) {
-            result.append(redactChunk(chunk, config));
-        }
-
-        return result.toString();
-    }
-
-    /**
-     * Detects PII entities for a given text snippet.
-     */
-    public List<PiiSpan> detect(String text, RedactionConfig config) {
-        if (text == null || text.isEmpty()) {
-            return Collections.emptyList();
+    public List<PiiEntity> detectPiiEntities(String text, LanguageCode languageCode) {
+        if (text == null || text.trim().isEmpty()) {
+            return List.of();
         }
 
         DetectPiiEntitiesRequest request = DetectPiiEntitiesRequest.builder()
                 .text(text)
-                .languageCode(config.languageCode)
+                .languageCode(languageCode != null ? languageCode : this.defaultLanguageCode)
                 .build();
 
         DetectPiiEntitiesResponse response = comprehendClient.detectPiiEntities(request);
+        return response.entities();
+    }
 
-        return response.entities().stream()
-                .filter(e -> e.score() >= config.minConfidenceScore)
-                .filter(e -> config.targetTypes.isEmpty() || config.targetTypes.contains(e.type()))
-                .map(e -> new PiiSpan(e.beginOffset(), e.endOffset(), e.typeAsString(), e.score()))
+    /**
+     * Redacts PII entities from the text replacing them with [ENTITY_TYPE] (e.g., [EMAIL]).
+     */
+    public String redact(String text) {
+        return redact(text, RedactionMaskType.ENTITY_TYPE, null, 0.5f);
+    }
+
+    /**
+     * Redacts PII entities from the text with a specified mask type and minimum confidence score threshold.
+     */
+    public String redact(String text, RedactionMaskType maskType, String customMask, float minScoreThreshold) {
+        if (text == null || text.isEmpty()) {
+            return text;
+        }
+
+        List<PiiEntity> entities = detectPiiEntities(text);
+        return applyRedaction(text, entities, maskType, customMask, minScoreThreshold);
+    }
+
+    /**
+     * Applies redaction to the text given detected PII entities.
+     * Replaces characters in reverse index order to preserve offsets.
+     */
+    public static String applyRedaction(
+            String text,
+            List<PiiEntity> entities,
+            RedactionMaskType maskType,
+            String customMask,
+            float minScoreThreshold) {
+
+        if (text == null || entities == null || entities.isEmpty()) {
+            return text;
+        }
+
+        // Filter by confidence score and sort in descending order of beginOffset
+        List<PiiEntity> sortedEntities = entities.stream()
+                .filter(e -> e.score() == null || e.score() >= minScoreThreshold)
+                .sorted(Comparator.comparingInt(PiiEntity::beginOffset).reversed())
                 .collect(Collectors.toList());
-    }
 
-    private String redactChunk(String chunk, RedactionConfig config) {
-        List<PiiSpan> spans = detect(chunk, config);
-        if (spans.isEmpty()) {
-            return chunk;
-        }
+        StringBuilder redacted = new StringBuilder(text);
 
-        List<PiiSpan> mergedSpans = mergeSpans(spans);
+        for (PiiEntity entity : sortedEntities) {
+            int start = entity.beginOffset();
+            int end = entity.endOffset();
 
-        StringBuilder sb = new StringBuilder();
-        int lastIndex = 0;
-
-        for (PiiSpan span : mergedSpans) {
-            sb.append(chunk, lastIndex, span.getBeginOffset());
-            sb.append(generateMask(chunk, span, config));
-            lastIndex = span.getEndOffset();
-        }
-
-        if (lastIndex < chunk.length()) {
-            sb.append(chunk, lastIndex, chunk.length());
-        }
-
-        return sb.toString();
-    }
-
-    private String generateMask(String chunk, PiiSpan span, RedactionConfig config) {
-        switch (config.mode) {
-            case REPLACE_WITH_TAG:
-                return config.defaultPlaceholder;
-            case REPLACE_WITH_TYPE:
-                return "[" + span.getType() + "]";
-            case MASK_CHARACTERS:
-                int len = span.getEndOffset() - span.getBeginOffset();
-                char[] chars = new char[Math.max(1, len)];
-                Arrays.fill(chars, config.maskChar);
-                return new String(chars);
-            default:
-                return config.defaultPlaceholder;
-        }
-    }
-
-    private List<PiiSpan> mergeSpans(List<PiiSpan> spans) {
-        if (spans.size() <= 1) {
-            return spans;
-        }
-
-        List<PiiSpan> sorted = new ArrayList<>(spans);
-        sorted.sort(Comparator.comparingInt(PiiSpan::getBeginOffset).thenComparingInt(PiiSpan::getEndOffset));
-
-        List<PiiSpan> merged = new ArrayList<>();
-        PiiSpan current = sorted.get(0);
-
-        for (int i = 1; i < sorted.size(); i++) {
-            PiiSpan next = sorted.get(i);
-            if (next.getBeginOffset() < current.getEndOffset()) {
-                // Overlapping spans: merge boundaries and join types
-                int newEnd = Math.max(current.getEndOffset(), next.getEndOffset());
-                String mergedType = current.getType().equals(next.getType())
-                        ? current.getType()
-                        : current.getType() + "/" + next.getType();
-                float maxScore = Math.max(current.getScore(), next.getScore());
-                current = new PiiSpan(current.getBeginOffset(), newEnd, mergedType, maxScore);
-            } else {
-                merged.add(current);
-                current = next;
+            if (start < 0 || end > redacted.length() || start >= end) {
+                continue;
             }
-        }
-        merged.add(current);
 
-        return merged;
-    }
-
-    private List<String> splitText(String text, int maxBytes) {
-        List<String> chunks = new ArrayList<>();
-        if (text.getBytes(StandardCharsets.UTF_8).length <= maxBytes) {
-            chunks.add(text);
-            return chunks;
-        }
-
-        String[] paragraphs = text.split("(?<=\\n)");
-        StringBuilder currentChunk = new StringBuilder();
-
-        for (String p : paragraphs) {
-            if (currentChunk.toString().getBytes(StandardCharsets.UTF_8).length + p.getBytes(StandardCharsets.UTF_8).length > maxBytes) {
-                if (currentChunk.length() > 0) {
-                    chunks.add(currentChunk.toString());
-                    currentChunk.setLength(0);
-                }
-                if (p.getBytes(StandardCharsets.UTF_8).length > maxBytes) {
-                    // Break by characters if a single paragraph exceeds the byte threshold
-                    int start = 0;
-                    while (start < p.length()) {
-                        int end = Math.min(start + 5000, p.length());
-                        chunks.add(p.substring(start, end));
-                        start = end;
-                    }
-                } else {
-                    currentChunk.append(p);
-                }
+            String replacement;
+            if (customMask != null && !customMask.isEmpty()) {
+                replacement = customMask;
             } else {
-                currentChunk.append(p);
+                replacement = switch (maskType != null ? maskType : RedactionMaskType.ENTITY_TYPE) {
+                    case GENERIC_MASK -> "[REDACTED]";
+                    case ASTERISKS -> "*".repeat(end - start);
+                    case ENTITY_TYPE -> "[" + entity.typeAsString() + "]";
+                };
             }
+
+            redacted.replace(start, end, replacement);
         }
 
-        if (currentChunk.length() > 0) {
-            chunks.add(currentChunk.toString());
-        }
-
-        return chunks;
-    }
-
-    @Override
-    public void close() {
-        if (ownsClient && comprehendClient != null) {
-            comprehendClient.close();
-        }
+        return redacted.toString();
     }
 }
+```
+
+```java
+package com.edgechain.lib.aws;
+
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.comprehend.ComprehendClient;
+import software.amazon.awssdk.services.comprehend.ComprehendClientBuilder;
+
+@Configuration
+@ConditionalOnProperty(prefix = "edgechain.aws.comprehend", name = "enabled", havingValue = "true", matchIfMissing = false)
+public class AwsComprehendAutoConfiguration {
+
+    @Bean
+    @ConfigurationProperties(prefix = "edgechain.aws.comprehend")
+    public AwsComprehendProperties awsComprehendProperties() {
+        return new AwsComprehendProperties();
+    }
+
+    @Bean
+    public ComprehendClient comprehendClient(AwsComprehendProperties properties) {
+        ComprehendClientBuilder builder = ComprehendClient.builder();
+
+        if (properties.getRegion() != null && !properties.getRegion().isBlank()) {
+            builder.region(Region.of(properties.getRegion()));
+        }
+
+        if (properties.getAccessKey() != null && !properties.getAccessKey().isBlank()
+                && properties.getSecretKey() != null && !properties.getSecretKey().isBlank()) {
+            builder.credentialsProvider(StaticCredentialsProvider.create(
+                    AwsBasicCredentials.create(properties.getAccessKey(), properties.getSecretKey())));
+        } else {
+            builder.credentialsProvider(DefaultCredentialsProvider.create());
+        }
+
+        return builder.build();
+    }
+
+    @Bean
+    public AwsComprehendRedactionService awsComprehendRedactionService(ComprehendClient comprehendClient) {
+        return new AwsComprehendRedactionService(comprehendClient);
+    }
+
+    public static class AwsComprehendProperties {
+        private boolean enabled = true;
+        private String region = "us-east-1";
+        private String accessKey;
+        private String secretKey;
+
+        public boolean isEnabled() { return enabled; }
+        public void setEnabled(boolean enabled) { this.enabled = enabled; }
+        public String getRegion() { return region; }
+        public void setRegion(String region) { this.region = region; }
+        public String getAccessKey() { return accessKey; }
+        public void setAccessKey(String accessKey) { this.accessKey = accessKey; }
+        public String getSecretKey() { return secretKey; }
+        public void setSecretKey(String secretKey) { this.secretKey = secretKey; }
+    }
+}
+```
+
+```groovy
+// build.gradle / build.gradle.kts dependency
+implementation("software.amazon.awssdk:comprehend:2.25.31")
 ```
