@@ -1,338 +1,160 @@
 ```java
-// File: src/main/java/com/edgechains/lib/comprehend/AwsComprehendRedactor.java
-
-package com.edgechains.lib.comprehend;
+package com.edgechains.lib.aws;
 
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
-import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.comprehend.ComprehendClient;
+import software.amazon.awssdk.services.comprehend.ComprehendClientBuilder;
 import software.amazon.awssdk.services.comprehend.model.DetectPiiEntitiesRequest;
 import software.amazon.awssdk.services.comprehend.model.DetectPiiEntitiesResponse;
 import software.amazon.awssdk.services.comprehend.model.LanguageCode;
 import software.amazon.awssdk.services.comprehend.model.PiiEntity;
-import software.amazon.awssdk.services.comprehend.model.PiiEntityType;
 
-import java.util.*;
-import java.util.stream.Collectors;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Objects;
 
 /**
- * Utility to detect and redact Personally Identifiable Information (PII)
- * using AWS Comprehend.
+ * Utility service using AWS Comprehend to detect and redact Personally Identifiable Information (PII).
  */
 public class AwsComprehendRedactor implements AutoCloseable {
 
-    private final ComprehendClient comprehendClient;
-    private final float defaultMinScore;
-    private final LanguageCode defaultLanguage;
+    public enum RedactionStrategy {
+        /** Replaces PII with generic placeholder: [REDACTED] */
+        GENERIC_MASK,
+        /** Replaces PII with entity type placeholder: e.g., [NAME], [EMAIL], [SSN] */
+        ENTITY_TYPE,
+        /** Masks each character with asterisks (e.g., 'John' -> '****') */
+        CHARACTER_MASK
+    }
 
-    public AwsComprehendRedactor() {
-        this(ComprehendClient.builder()
-                .credentialsProvider(DefaultCredentialsProvider.create())
-                .region(Region.US_EAST_1)
-                .build(), 0.5f, LanguageCode.EN);
+    private static final double DEFAULT_MIN_CONFIDENCE_SCORE = 0.5;
+    private static final LanguageCode DEFAULT_LANGUAGE_CODE = LanguageCode.EN;
+
+    private final ComprehendClient comprehendClient;
+    private final boolean manageClientLifecycle;
+
+    public AwsComprehendRedactor(ComprehendClient comprehendClient) {
+        this.comprehendClient = Objects.requireNonNull(comprehendClient, "ComprehendClient must not be null");
+        this.manageClientLifecycle = false;
     }
 
     public AwsComprehendRedactor(Region region) {
-        this(ComprehendClient.builder()
-                .credentialsProvider(DefaultCredentialsProvider.create())
-                .region(region)
-                .build(), 0.5f, LanguageCode.EN);
+        this.comprehendClient = ComprehendClient.builder().region(region).build();
+        this.manageClientLifecycle = true;
     }
 
     public AwsComprehendRedactor(Region region, AwsCredentialsProvider credentialsProvider) {
-        this(ComprehendClient.builder()
-                .credentialsProvider(credentialsProvider)
-                .region(region)
-                .build(), 0.5f, LanguageCode.EN);
-    }
-
-    public AwsComprehendRedactor(ComprehendClient comprehendClient, float defaultMinScore, LanguageCode defaultLanguage) {
-        this.comprehendClient = Objects.requireNonNull(comprehendClient, "comprehendClient must not be null");
-        this.defaultMinScore = defaultMinScore;
-        this.defaultLanguage = Objects.requireNonNull(defaultLanguage, "defaultLanguage must not be null");
-    }
-
-    public enum RedactionStrategy {
-        LABEL,          // Replace with [REDACTED_TYPE], e.g. [REDACTED_SSN]
-        MASK,           // Replace with fixed mask '***'
-        CHARACTER_MASK  // Replace characters with '*' keeping the same length
-    }
-
-    public static class RedactionOptions {
-        private float minConfidence = 0.5f;
-        private LanguageCode languageCode = LanguageCode.EN;
-        private RedactionStrategy strategy = RedactionStrategy.LABEL;
-        private Set<PiiEntityType> targetTypes = Collections.emptySet(); // Empty = redact all detected
-        private String customMask = null;
-
-        public static RedactionOptions create() {
-            return new RedactionOptions();
+        ComprehendClientBuilder builder = ComprehendClient.builder().region(region);
+        if (credentialsProvider != null) {
+            builder.credentialsProvider(credentialsProvider);
         }
-
-        public RedactionOptions minConfidence(float minConfidence) {
-            this.minConfidence = minConfidence;
-            return this;
-        }
-
-        public RedactionOptions languageCode(LanguageCode languageCode) {
-            this.languageCode = languageCode;
-            return this;
-        }
-
-        public RedactionOptions strategy(RedactionStrategy strategy) {
-            this.strategy = strategy;
-            return this;
-        }
-
-        public RedactionOptions targetTypes(Set<PiiEntityType> targetTypes) {
-            this.targetTypes = targetTypes == null ? Collections.emptySet() : targetTypes;
-            return this;
-        }
-
-        public RedactionOptions customMask(String customMask) {
-            this.customMask = customMask;
-            return this;
-        }
+        this.comprehendClient = builder.build();
+        this.manageClientLifecycle = true;
     }
 
     /**
-     * Redacts PII in the input text with default settings.
+     * Redacts PII entities from the given text using default settings.
      *
-     * @param text The input string to redact.
-     * @return The redacted string.
+     * @param text The source text containing sensitive data.
+     * @return Redacted text.
      */
-    public String redact(String text) {
-        return redact(text, RedactionOptions.create().minConfidence(this.defaultMinScore).languageCode(this.defaultLanguage));
+    public String redactPii(String text) {
+        return redactPii(text, DEFAULT_LANGUAGE_CODE, DEFAULT_MIN_CONFIDENCE_SCORE, RedactionStrategy.GENERIC_MASK);
     }
 
     /**
-     * Redacts PII in the input text with custom options.
+     * Redacts PII entities from the given text using a specified redaction strategy.
      *
-     * @param text The input string to redact.
-     * @param options Redaction options.
-     * @return The redacted string.
+     * @param text     The source text containing sensitive data.
+     * @param strategy The redaction replacement strategy.
+     * @return Redacted text.
      */
-    public String redact(String text, RedactionOptions options) {
-        if (text == null || text.trim().isEmpty()) {
+    public String redactPii(String text, RedactionStrategy strategy) {
+        return redactPii(text, DEFAULT_LANGUAGE_CODE, DEFAULT_MIN_CONFIDENCE_SCORE, strategy);
+    }
+
+    /**
+     * Redacts PII entities from the text with customizable language, confidence threshold, and strategy.
+     *
+     * @param text               The source text containing sensitive data.
+     * @param languageCode       The language code of the text (e.g., LanguageCode.EN).
+     * @param minConfidenceScore Minimum entity detection score (0.0 to 1.0) required to apply redaction.
+     * @param strategy           The replacement strategy.
+     * @return Redacted text.
+     */
+    public String redactPii(String text, LanguageCode languageCode, double minConfidenceScore, RedactionStrategy strategy) {
+        if (text == null || text.isBlank()) {
             return text;
         }
 
-        DetectPiiEntitiesRequest request = DetectPiiEntitiesRequest.builder()
-                .text(text)
-                .languageCode(options.languageCode)
-                .build();
-
-        DetectPiiEntitiesResponse response = comprehendClient.detectPiiEntities(request);
-        List<PiiEntity> entities = response.entities();
-
-        if (entities == null || entities.isEmpty()) {
+        List<PiiEntity> detectedEntities = detectPiiEntities(text, languageCode);
+        if (detectedEntities.isEmpty()) {
             return text;
         }
 
-        // Filter by confidence score and target entity types
-        List<PiiEntity> filtered = entities.stream()
-                .filter(e -> e.score() >= options.minConfidence)
-                .filter(e -> options.targetTypes.isEmpty() || options.targetTypes.contains(e.type()))
-                .sorted(Comparator.comparingInt(PiiEntity::beginOffset).reversed())
-                .collect(Collectors.toList());
+        List<PiiEntity> sortedEntities = new ArrayList<>(detectedEntities);
+        // Sort descending by begin offset to prevent offset shifting during replacements
+        sortedEntities.sort((a, b) -> Integer.compare(b.beginOffset(), a.beginOffset()));
 
-        // Redact in reverse offset order to preserve string indices
-        StringBuilder sb = new StringBuilder(text);
-        int lastEnd = Integer.MAX_VALUE;
+        StringBuilder redacted = new StringBuilder(text);
+        int lastStart = Integer.MAX_VALUE;
 
-        for (PiiEntity entity : filtered) {
-            int begin = entity.beginOffset();
-            int end = entity.endOffset();
-
-            // Guard against invalid bounds or overlapping entities
-            if (begin < 0 || end > sb.length() || begin >= end || end > lastEnd) {
+        for (PiiEntity entity : sortedEntities) {
+            if (entity.score() != null && entity.score() < minConfidenceScore) {
                 continue;
             }
 
-            String replacement = generateReplacement(entity, options, end - begin);
-            sb.replace(begin, end, replacement);
-            lastEnd = begin;
+            int start = entity.beginOffset();
+            int end = entity.endOffset();
+
+            // Guard against invalid or overlapping entity bounds
+            if (start >= 0 && end <= redacted.length() && start <= end && end <= lastStart) {
+                String replacement = resolveReplacement(entity, text.substring(start, end), strategy);
+                redacted.replace(start, end, replacement);
+                lastStart = start;
+            }
         }
 
-        return sb.toString();
+        return redacted.toString();
     }
 
     /**
-     * Detects all PII entities above the confidence threshold without redacting.
+     * Detects PII entities without modifying the text.
+     *
+     * @param text         The input text.
+     * @param languageCode The language of the input text.
+     * @return An unmodifiable list of detected PiiEntity records.
      */
-    public List<PiiEntity> detect(String text, LanguageCode languageCode, float minConfidence) {
-        if (text == null || text.trim().isEmpty()) {
+    public List<PiiEntity> detectPiiEntities(String text, LanguageCode languageCode) {
+        if (text == null || text.isBlank()) {
             return Collections.emptyList();
         }
 
         DetectPiiEntitiesRequest request = DetectPiiEntitiesRequest.builder()
                 .text(text)
-                .languageCode(languageCode != null ? languageCode : this.defaultLanguage)
+                .languageCode(languageCode != null ? languageCode : DEFAULT_LANGUAGE_CODE)
                 .build();
 
         DetectPiiEntitiesResponse response = comprehendClient.detectPiiEntities(request);
-        return response.entities().stream()
-                .filter(e -> e.score() >= minConfidence)
-                .collect(Collectors.toList());
+        return response.hasEntities() ? response.entities() : Collections.emptyList();
     }
 
-    private String generateReplacement(PiiEntity entity, RedactionOptions options, int originalLength) {
-        if (options.customMask != null) {
-            return options.customMask;
-        }
-
-        switch (options.strategy) {
-            case MASK:
-                return "***";
-            case CHARACTER_MASK:
-                return "*".repeat(Math.max(1, originalLength));
-            case LABEL:
-            default:
-                return "[REDACTED_" + entity.typeAsString() + "]";
-        }
+    private String resolveReplacement(PiiEntity entity, String originalSubstring, RedactionStrategy strategy) {
+        RedactionStrategy strat = strategy != null ? strategy : RedactionStrategy.GENERIC_MASK;
+        return switch (strat) {
+            case ENTITY_TYPE -> "[" + (entity.typeAsString() != null ? entity.typeAsString() : "PII") + "]";
+            case CHARACTER_MASK -> "*".repeat(originalSubstring.length());
+            case GENERIC_MASK -> "[REDACTED]";
+        };
     }
 
     @Override
     public void close() {
-        if (this.comprehendClient != null) {
-            this.comprehendClient.close();
+        if (manageClientLifecycle && comprehendClient != null) {
+            comprehendClient.close();
         }
     }
 }
-```
-
-```xml
-<!-- File: pom.xml dependency addition for EdgeChains -->
-<dependency>
-    <groupId>software.amazon.awssdk</groupId>
-    <artifactId>comprehend</artifactId>
-    <version>2.25.10</version>
-</dependency>
-```
-
-```java
-// File: src/test/java/com/edgechains/lib/comprehend/AwsComprehendRedactorTest.java
-
-package com.edgechains.lib.comprehend;
-
-import org.junit.jupiter.api.Test;
-import software.amazon.awssdk.services.comprehend.ComprehendClient;
-import software.amazon.awssdk.services.comprehend.model.DetectPiiEntitiesRequest;
-import software.amazon.awssdk.services.comprehend.model.DetectPiiEntitiesResponse;
-import software.amazon.awssdk.services.comprehend.model.PiiEntity;
-import software.amazon.awssdk.services.comprehend.model.PiiEntityType;
-
-import java.util.List;
-
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.when;
-
-public class AwsComprehendRedactorTest {
-
-    @Test
-    public void testRedactPiiEntities() {
-        ComprehendClient mockClient = mock(ComprehendClient.class);
-        String originalText = "Contact Jane Doe at jane.doe@example.com or 555-0199.";
-
-        List<PiiEntity> mockedEntities = List.of(
-                PiiEntity.builder().type(PiiEntityType.NAME).score(0.99f).beginOffset(8).endOffset(16).build(),
-                PiiEntity.builder().type(PiiEntityType.EMAIL).score(0.98f).beginOffset(20).endOffset(40).build(),
-                PiiEntity.builder().type(PiiEntityType.PHONE).score(0.95f).beginOffset(44).endOffset(52).build()
-        );
-
-        when(mockClient.detectPiiEntities(any(DetectPiiEntitiesRequest.class)))
-                .thenReturn(DetectPiiEntitiesResponse.builder().entities(mockedEntities).build());
-
-        AwsComprehendRedactor redactor = new AwsComprehendRedactor(mockClient, 0.5f, software.amazon.awssdk.services.comprehend.model.LanguageCode.EN);
-
-        String result = redactor.redact(originalText);
-        assertEquals("Contact [REDACTED_NAME] at [REDACTED_EMAIL] or [REDACTED_PHONE].", result);
-    }
-}
-```
-
-```json
-// File: capacitor.config.json
-// Capacitor mobile configuration for BAWES Universe (WorkAdventure Mobile App)
-{
-  "appId": "com.bawes.universe.mobile",
-  "appName": "BAWES Universe",
-  "webDir": "dist",
-  "bundledWebRuntime": false,
-  "server": {
-    "url": "https://play.workadventu.re",
-    "cleartext": false,
-    "allowNavigation": [
-      "*.workadventu.re",
-      "*.bawes.net"
-    ]
-  },
-  "android": {
-    "allowMixedContent": false,
-    "captureInput": true,
-    "webContentsDebuggingEnabled": false
-  },
-  "ios": {
-    "allowsInlineMediaPlayback": true,
-    "scrollEnabled": false
-  },
-  "plugins": {
-    "SplashScreen": {
-      "launchShowDuration": 2000,
-      "backgroundColor": "#0c0d14"
-    }
-  }
-}
-```
-
-```xml
-<!-- File: android/app/src/main/AndroidManifest.xml -->
-<!-- Required permissions for WebRTC audio/video chat and camera in BAWES WorkAdventure Mobile App -->
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.bawes.universe.mobile">
-
-    <uses-permission android:name="android.permission.INTERNET" />
-    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-    <uses-permission android:name="android.permission.CAMERA" />
-    <uses-permission android:name="android.permission.RECORD_AUDIO" />
-    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
-
-    <uses-feature android:name="android.hardware.camera" android:required="false" />
-    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
-    <uses-feature android:name="android.hardware.microphone" android:required="false" />
-
-    <application
-        android:allowBackup="true"
-        android:icon="@mipmap/ic_launcher"
-        android:label="@string/app_name"
-        android:roundIcon="@mipmap/ic_launcher_round"
-        android:supportsRtl="true"
-        android:theme="@style/AppTheme">
-        
-        <activity
-            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|locale|smallestScreenSize|screenLayout|uiMode"
-            android:name=".MainActivity"
-            android:label="@string/title_activity_main"
-            android:theme="@style/AppTheme.NoActionBarLaunch"
-            android:launchMode="singleTask"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity>
-    </application>
-</manifest>
-```
-
-```xml
-<!-- File: ios/App/App/Info.plist -->
-<!-- Required permissions for WebRTC audio/video in BAWES WorkAdventure Mobile App -->
-<key>NSCameraUsageDescription</key>
-<string>BAWES Universe requires camera access for peer-to-peer video chat in virtual spaces.</string>
-<key>NSMicrophoneUsageDescription</key>
-<string>BAWES Universe requires microphone access for spatial voice chat.</string>
 ```
