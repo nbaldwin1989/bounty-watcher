@@ -1,17 +1,5 @@
-### 1. EdgeChains: AWS Comprehend PII Data Redaction Utility
-
-#### `pom.xml` (Dependency Addition)
-```xml
-<dependency>
-    <groupId>software.amazon.awssdk</groupId>
-    <artifactId>comprehend</artifactId>
-    <version>2.25.16</version>
-</dependency>
-```
-
-#### `src/main/java/com/edgechains/lib/utils/AwsComprehendRedactor.java`
 ```java
-package com.edgechains.lib.utils;
+package com.edgechains.lib.aws.comprehend;
 
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
@@ -21,246 +9,292 @@ import software.amazon.awssdk.services.comprehend.model.DetectPiiEntitiesRequest
 import software.amazon.awssdk.services.comprehend.model.DetectPiiEntitiesResponse;
 import software.amazon.awssdk.services.comprehend.model.LanguageCode;
 import software.amazon.awssdk.services.comprehend.model.PiiEntity;
+import software.amazon.awssdk.services.comprehend.model.PiiEntityType;
 
-import java.util.Comparator;
-import java.util.List;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
 import java.util.stream.Collectors;
 
+/**
+ * Utility to detect and redact PII (Personally Identifiable Information)
+ * using AWS Comprehend.
+ */
 public class AwsComprehendRedactor implements AutoCloseable {
 
-    private final ComprehendClient comprehendClient;
-    private final float minScoreThreshold;
+    private static final int MAX_BYTE_SIZE = 100_000; // AWS Comprehend payload limit
+    private static final float DEFAULT_THRESHOLD = 0.5f;
 
-    public enum MaskMode {
-        TAG_NAME,    // Replaces with [EMAIL], [NAME], etc.
-        ASTERISK,    // Replaces with *******
-        FIXED_MASK   // Replaces with [REDACTED]
+    private final ComprehendClient comprehendClient;
+    private final boolean manageClientLifecycle;
+    private final LanguageCode languageCode;
+    private final float confidenceThreshold;
+    private final Set<PiiEntityType> targetEntityTypes;
+    private final RedactionMaskMode maskMode;
+    private final String customMask;
+
+    public enum RedactionMaskMode {
+        ENTITY_TYPE,  // Replaces with [EMAIL], [SSN], [NAME], etc.
+        FIXED_STRING, // Replaces with a fixed string, e.g. [REDACTED]
+        ASTERISKS     // Replaces characters with *
+    }
+
+    public static class Builder {
+        private ComprehendClient comprehendClient;
+        private Region region = Region.US_EAST_1;
+        private AwsCredentialsProvider credentialsProvider;
+        private LanguageCode languageCode = LanguageCode.EN;
+        private float confidenceThreshold = DEFAULT_THRESHOLD;
+        private Set<PiiEntityType> targetEntityTypes = EnumSet.allOf(PiiEntityType.class);
+        private RedactionMaskMode maskMode = RedactionMaskMode.ENTITY_TYPE;
+        private String customMask = "[REDACTED]";
+
+        public Builder comprehendClient(ComprehendClient client) {
+            this.comprehendClient = client;
+            return this;
+        }
+
+        public Builder region(Region region) {
+            this.region = region;
+            return this;
+        }
+
+        public Builder credentialsProvider(AwsCredentialsProvider credentialsProvider) {
+            this.credentialsProvider = credentialsProvider;
+            return this;
+        }
+
+        public Builder languageCode(LanguageCode languageCode) {
+            this.languageCode = languageCode;
+            return this;
+        }
+
+        public Builder confidenceThreshold(float threshold) {
+            this.confidenceThreshold = threshold;
+            return this;
+        }
+
+        public Builder targetEntityTypes(Set<PiiEntityType> entityTypes) {
+            this.targetEntityTypes = entityTypes != null ? EnumSet.copyOf(entityTypes) : EnumSet.allOf(PiiEntityType.class);
+            return this;
+        }
+
+        public Builder maskMode(RedactionMaskMode maskMode) {
+            this.maskMode = maskMode;
+            return this;
+        }
+
+        public Builder customMask(String customMask) {
+            this.customMask = customMask;
+            return this;
+        }
+
+        public AwsComprehendRedactor build() {
+            boolean manageLifecycle = false;
+            ComprehendClient client = this.comprehendClient;
+            if (client == null) {
+                var clientBuilder = ComprehendClient.builder().region(this.region);
+                if (this.credentialsProvider != null) {
+                    clientBuilder.credentialsProvider(this.credentialsProvider);
+                } else {
+                    clientBuilder.credentialsProvider(DefaultCredentialsProvider.create());
+                }
+                client = clientBuilder.build();
+                manageLifecycle = true;
+            }
+            return new AwsComprehendRedactor(client, manageLifecycle, this.languageCode,
+                    this.confidenceThreshold, this.targetEntityTypes, this.maskMode, this.customMask);
+        }
+    }
+
+    public static Builder builder() {
+        return new Builder();
     }
 
     public AwsComprehendRedactor() {
-        this(Region.US_EAST_1, DefaultCredentialsProvider.create(), 0.8f);
+        this(ComprehendClient.builder().credentialsProvider(DefaultCredentialsProvider.create()).build(),
+                true, LanguageCode.EN, DEFAULT_THRESHOLD, EnumSet.allOf(PiiEntityType.class),
+                RedactionMaskMode.ENTITY_TYPE, "[REDACTED]");
     }
 
-    public AwsComprehendRedactor(Region region, AwsCredentialsProvider credentialsProvider, float minScoreThreshold) {
-        this.comprehendClient = ComprehendClient.builder()
-                .region(region)
-                .credentialsProvider(credentialsProvider)
-                .build();
-        this.minScoreThreshold = minScoreThreshold;
+    public AwsComprehendRedactor(ComprehendClient comprehendClient) {
+        this(comprehendClient, false, LanguageCode.EN, DEFAULT_THRESHOLD,
+                EnumSet.allOf(PiiEntityType.class), RedactionMaskMode.ENTITY_TYPE, "[REDACTED]");
     }
 
-    public AwsComprehendRedactor(ComprehendClient comprehendClient, float minScoreThreshold) {
-        this.comprehendClient = comprehendClient;
-        this.minScoreThreshold = minScoreThreshold;
+    private AwsComprehendRedactor(ComprehendClient comprehendClient, boolean manageClientLifecycle,
+                                  LanguageCode languageCode, float confidenceThreshold,
+                                  Set<PiiEntityType> targetEntityTypes, RedactionMaskMode maskMode,
+                                  String customMask) {
+        this.comprehendClient = Objects.requireNonNull(comprehendClient, "ComprehendClient must not be null");
+        this.manageClientLifecycle = manageClientLifecycle;
+        this.languageCode = languageCode;
+        this.confidenceThreshold = confidenceThreshold;
+        this.targetEntityTypes = targetEntityTypes;
+        this.maskMode = maskMode;
+        this.customMask = customMask;
     }
 
-    public String redact(String text) {
-        return redact(text, LanguageCode.EN, MaskMode.TAG_NAME);
-    }
-
-    public String redact(String text, LanguageCode languageCode, MaskMode maskMode) {
-        if (text == null || text.isBlank()) {
-            return text;
+    /**
+     * Redacts PII entities from the input text.
+     *
+     * @param text The input string to redact.
+     * @return RedactionResult containing redacted text and detected entities.
+     */
+    public RedactionResult redact(String text) {
+        if (text == null || text.isEmpty()) {
+            return new RedactionResult(text, Collections.emptyList());
         }
 
+        byte[] utf8Bytes = text.getBytes(StandardCharsets.UTF_8);
+        if (utf8Bytes.length <= MAX_BYTE_SIZE) {
+            return redactChunk(text);
+        }
+
+        return redactLargeText(text);
+    }
+
+    private RedactionResult redactChunk(String text) {
         DetectPiiEntitiesRequest request = DetectPiiEntitiesRequest.builder()
                 .text(text)
-                .languageCode(languageCode)
+                .languageCode(this.languageCode)
                 .build();
 
         DetectPiiEntitiesResponse response = comprehendClient.detectPiiEntities(request);
 
-        List<PiiEntity> entities = response.entities().stream()
-                .filter(entity -> entity.score() != null && entity.score() >= minScoreThreshold)
-                .sorted(Comparator.comparingInt(PiiEntity::beginOffset).reversed())
+        List<PiiEntity> filteredEntities = response.entities().stream()
+                .filter(entity -> entity.score() != null && entity.score() >= this.confidenceThreshold)
+                .filter(entity -> this.targetEntityTypes.contains(entity.type()))
+                .sorted(Comparator.comparingInt(PiiEntity::beginOffset))
                 .collect(Collectors.toList());
 
-        StringBuilder redacted = new StringBuilder(text);
+        List<PiiEntity> nonOverlapping = resolveOverlaps(filteredEntities);
 
-        for (PiiEntity entity : entities) {
+        StringBuilder sb = new StringBuilder(text);
+        List<PiiEntity> reverseSorted = new ArrayList<>(nonOverlapping);
+        reverseSorted.sort((a, b) -> Integer.compare(b.beginOffset(), a.beginOffset()));
+
+        for (PiiEntity entity : reverseSorted) {
             int start = entity.beginOffset();
             int end = entity.endOffset();
-
-            if (start < 0 || end > redacted.length() || start >= end) {
-                continue;
-            }
-
-            String replacement;
-            switch (maskMode) {
-                case ASTERISK:
-                    replacement = "*".repeat(end - start);
-                    break;
-                case FIXED_MASK:
-                    replacement = "[REDACTED]";
-                    break;
-                case TAG_NAME:
-                default:
-                    replacement = "[" + entity.typeAsString() + "]";
-                    break;
-            }
-
-            redacted.replace(start, end, replacement);
+            String replacement = getReplacement(entity, text.substring(start, end));
+            sb.replace(start, end, replacement);
         }
 
-        return redacted.toString();
+        return new RedactionResult(sb.toString(), nonOverlapping);
+    }
+
+    private RedactionResult redactLargeText(String text) {
+        List<String> chunks = splitIntoChunks(text, MAX_BYTE_SIZE);
+        StringBuilder redactedFull = new StringBuilder();
+        List<PiiEntity> allEntities = new ArrayList<>();
+
+        int globalOffset = 0;
+        for (String chunk : chunks) {
+            RedactionResult chunkResult = redactChunk(chunk);
+            redactedFull.append(chunkResult.getRedactedText());
+
+            for (PiiEntity e : chunkResult.getDetectedEntities()) {
+                allEntities.add(PiiEntity.builder()
+                        .type(e.type())
+                        .score(e.score())
+                        .beginOffset(e.beginOffset() + globalOffset)
+                        .endOffset(e.endOffset() + globalOffset)
+                        .build());
+            }
+            globalOffset += chunk.length();
+        }
+
+        return new RedactionResult(redactedFull.toString(), allEntities);
+    }
+
+    private List<PiiEntity> resolveOverlaps(List<PiiEntity> entities) {
+        List<PiiEntity> resolved = new ArrayList<>();
+        PiiEntity prev = null;
+        for (PiiEntity curr : entities) {
+            if (prev == null) {
+                resolved.add(curr);
+                prev = curr;
+            } else if (curr.beginOffset() >= prev.endOffset()) {
+                resolved.add(curr);
+                prev = curr;
+            } else {
+                if (curr.score() > prev.score()) {
+                    resolved.remove(resolved.size() - 1);
+                    resolved.add(curr);
+                    prev = curr;
+                }
+            }
+        }
+        return resolved;
+    }
+
+    private String getReplacement(PiiEntity entity, String originalText) {
+        switch (this.maskMode) {
+            case ENTITY_TYPE:
+                return "[" + entity.typeAsString() + "]";
+            case FIXED_STRING:
+                return this.customMask;
+            case ASTERISKS:
+                return "*".repeat(originalText.length());
+            default:
+                return "[REDACTED]";
+        }
+    }
+
+    private List<String> splitIntoChunks(String text, int maxBytes) {
+        List<String> chunks = new ArrayList<>();
+        String[] lines = text.split("(?<=\n)");
+        StringBuilder currentChunk = new StringBuilder();
+        int currentBytes = 0;
+
+        for (String line : lines) {
+            int lineBytes = line.getBytes(StandardCharsets.UTF_8).length;
+            if (currentBytes + lineBytes > maxBytes && currentChunk.length() > 0) {
+                chunks.add(currentChunk.toString());
+                currentChunk = new StringBuilder();
+                currentBytes = 0;
+            }
+            currentChunk.append(line);
+            currentBytes += lineBytes;
+        }
+        if (currentChunk.length() > 0) {
+            chunks.add(currentChunk.toString());
+        }
+        return chunks;
     }
 
     @Override
     public void close() {
-        if (comprehendClient != null) {
+        if (manageClientLifecycle && comprehendClient != null) {
             comprehendClient.close();
         }
     }
-}
-```
 
----
+    public static class RedactionResult {
+        private final String redactedText;
+        private final List<PiiEntity> detectedEntities;
 
-### 2. WorkAdventure Universe: Mobile App Wrapper (Android + iOS)
-
-#### `package.json`
-```json
-{
-  "name": "workadventure-universe-mobile",
-  "version": "1.0.0",
-  "private": true,
-  "scripts": {
-    "android": "react-native run-android",
-    "ios": "react-native run-ios",
-    "start": "react-native start"
-  },
-  "dependencies": {
-    "react": "18.2.0",
-    "react-native": "0.73.4",
-    "react-native-safe-area-context": "^4.9.0",
-    "react-native-webview": "^13.8.4"
-  }
-}
-```
-
-#### `App.tsx`
-```tsx
-import React, { useRef, useState } from 'react';
-import {
-  SafeAreaView,
-  StyleSheet,
-  StatusBar,
-  ActivityIndicator,
-  View,
-  BackHandler,
-  Platform,
-} from 'react-native';
-import { WebView } from 'react-native-webview';
-
-const DEFAULT_UNIVERSE_URL = 'https://play.workadventu.re';
-
-export default function App() {
-  const webViewRef = useRef<WebView>(null);
-  const [canGoBack, setCanGoBack] = useState(false);
-  const [loading, setLoading] = useState(true);
-
-  React.useEffect(() => {
-    if (Platform.OS === 'android') {
-      const onBackPress = () => {
-        if (canGoBack && webViewRef.current) {
-          webViewRef.current.goBack();
-          return true;
+        public RedactionResult(String redactedText, List<PiiEntity> detectedEntities) {
+            this.redactedText = redactedText;
+            this.detectedEntities = detectedEntities;
         }
-        return false;
-      };
-      BackHandler.addEventListener('hardwareBackPress', onBackPress);
-      return () => BackHandler.removeEventListener('hardwareBackPress', onBackPress);
+
+        public String getRedactedText() {
+            return redactedText;
+        }
+
+        public List<PiiEntity> getDetectedEntities() {
+            return detectedEntities;
+        }
     }
-  }, [canGoBack]);
-
-  return (
-    <SafeAreaView style={styles.container}>
-      <StatusBar barStyle="light-content" backgroundColor="#000000" />
-      <WebView
-        ref={webViewRef}
-        source={{ uri: DEFAULT_UNIVERSE_URL }}
-        style={styles.webView}
-        javaScriptEnabled={true}
-        domStorageEnabled={true}
-        allowsInlineMediaPlayback={true}
-        mediaPlaybackRequiresUserAction={false}
-        mediaCapturePermissionGrantType="grant"
-        originWhitelist={['*']}
-        userAgent="WorkAdventureMobileApp/1.0.0"
-        onNavigationStateChange={(navState) => setCanGoBack(navState.canGoBack)}
-        onLoadEnd={() => setLoading(false)}
-      />
-      {loading && (
-        <View style={styles.loaderContainer}>
-          <ActivityIndicator size="large" color="#4F46E5" />
-        </View>
-      )}
-    </SafeAreaView>
-  );
 }
-
-const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: '#000000',
-  },
-  webView: {
-    flex: 1,
-  },
-  loaderContainer: {
-    ...StyleSheet.absoluteFillObject,
-    justifyContent: 'center',
-    alignItems: 'center',
-    backgroundColor: 'rgba(0, 0, 0, 0.7)',
-  },
-});
 ```
 
-#### `android/app/src/main/AndroidManifest.xml` (Permissions & WebRTC support)
 ```xml
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <uses-permission android:name="android.permission.INTERNET" />
-    <uses-permission android:name="android.permission.CAMERA" />
-    <uses-permission android:name="android.permission.RECORD_AUDIO" />
-    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
-    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-    <uses-feature android:name="android.hardware.camera" android:required="false" />
-    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
-    <uses-feature android:name="android.hardware.microphone" android:required="false" />
-
-    <application
-        android:name=".MainApplication"
-        android:label="Universe"
-        android:icon="@mipmap/ic_launcher"
-        android:roundIcon="@mipmap/ic_launcher_round"
-        android:allowBackup="false"
-        android:theme="@style/AppTheme"
-        android:usesCleartextTraffic="true">
-        <activity
-            android:name=".MainActivity"
-            android:exported="true"
-            android:configChanges="keyboard|keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize|uiMode"
-            android:launchMode="singleTask"
-            android:windowSoftInputMode="adjustResize">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity>
-    </application>
-</manifest>
-```
-
-#### `ios/WorkAdventureUniverse/Info.plist` (Microphone and Camera Permissions)
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>NSCameraUsageDescription</key>
-    <string>Camera access is required for video calls in BAWES Universe.</string>
-    <key>NSMicrophoneUsageDescription</key>
-    <string>Microphone access is required for audio communication in BAWES Universe.</string>
-</dict>
-</plist>
+<!-- Add to pom.xml under <dependencies> if not already present -->
+<dependency>
+    <groupId>software.amazon.awssdk</groupId>
+    <artifactId>comprehend</artifactId>
+    <version>2.25.16</version>
+</dependency>
 ```
